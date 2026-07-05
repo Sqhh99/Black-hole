@@ -1,0 +1,15 @@
+.cache/
+.claude
+.vscode
+CMakeFiles/
+CMakeCache.txt
+.DS_Store
+Makefile
+cmake_install.cmake
+out
+build/
+third_party
+agents
+models
+
+.vs/

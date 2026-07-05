@@ -1,0 +1,8 @@
+{
+  "name": "blackhole-cuda-vulkan",
+  "version": "1.0.0",
+  "description": "Real-time Schwarzschild black hole renderer (CUDA + Vulkan)",
+  "dependencies": [
+    "glfw3"
+  ]
+}
