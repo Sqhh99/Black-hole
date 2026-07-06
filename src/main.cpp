@@ -17,6 +17,7 @@
 //   [ , ] ................... spin a* down / up      (Kerr, Kerr-Newman)
 //   , . ................... charge q down / up     (RN, Kerr-Newman)
 //   F1 ...................... toggle accretion disk
+//   F11 ..................... toggle native fullscreen
 //   SPACE ................... pause / resume disk animation
 //   ESC ..................... quit
 // ---------------------------------------------------------------------------
@@ -64,6 +65,7 @@ struct AppState
     bool   bhDirty = true;
 
     bool   bloomOn = true;   // HDR bloom of the disk / photon ring
+    bool   fullscreenToggleRequested = false;
 };
 
 AppState g;
@@ -144,7 +146,7 @@ void fillCamera(RenderParams& p)
     p.camRight   = {rxx, rxy, rxz};
     p.camUp      = {ux, uy, uz};
     p.tanHalfFov = std::tan(60.f * kPi / 180.f * 0.5f);
-    p.aspect     = (float)kWidth / (float)kHeight;
+    p.aspect     = (p.height > 0) ? (float)p.width / (float)p.height : 16.f / 9.f;
 }
 
 // ---------------- GLFW callbacks ----------------
@@ -193,6 +195,7 @@ void onKey(GLFWwindow* w, int key, int, int action, int)
     switch (key)
     {
     case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_F11: g.fullscreenToggleRequested = true; break;
     case GLFW_KEY_F2: g.model = BH_SCHWARZSCHILD;      g.bhDirty = true; break;
     case GLFW_KEY_F3: g.model = BH_REISSNER_NORDSTROM; g.bhDirty = true; break;
     case GLFW_KEY_F4: g.model = BH_KERR;               g.bhDirty = true; break;
@@ -251,7 +254,7 @@ int main()
                 "CUDA-Vulkan interop requires rendering and presenting on the "
                 "same NVIDIA GPU.");
 
-        cuda.init(cudaDev, (int)kWidth, (int)kHeight,
+        cuda.init(cudaDev, (int)vk.width(), (int)vk.height(),
                   vk.interopMemoryHandle(), vk.interopAllocSize(), vk.interopBufferSize(),
                   vk.semVkToCudaHandle(), vk.semCudaToVkHandle());
 
@@ -262,15 +265,16 @@ int main()
         glfwSetKeyCallback(win, onKey);
 
         LOG_INFO("Controls: LMB drag=orbit  wheel/W/S=zoom  A/D/Q/E=rotate  "
-                 "-/= exposure  1/2/3 quality  F1 disk  SPACE pause  ESC quit");
+                 "-/= exposure  1/2/3 quality  F1 disk  F11 fullscreen  "
+                 "SPACE pause  ESC quit");
         LOG_INFO("Models:   F2 Schwarzschild  F3 Reissner-Nordstrom  F4 Kerr  "
                  "F5 Kerr-Newman  |  [/] spin a*  ,/. charge q  |  B bloom");
         LOG_INFO("Quality:  hold the camera still and the image refines "
                  "itself (progressive anti-aliasing)");
 
         RenderParams params;
-        params.width  = (int)kWidth;
-        params.height = (int)kHeight;
+        params.width  = (int)vk.width();
+        params.height = (int)vk.height();
         params.swapRB = vk.swapRB() ? 1 : 0;
         applyBlackHole(params);
         g.bhDirty = false;
@@ -292,6 +296,24 @@ int main()
             glfwGetFramebufferSize(win, &fbw, &fbh);
             if (fbw == 0 || fbh == 0) { glfwWaitEvents(); continue; }
 
+            if (g.fullscreenToggleRequested)
+            {
+                g.fullscreenToggleRequested = false;
+                cuda.sync();
+                vk.waitIdle();
+                cuda.releaseFrameResources();
+                vk.toggleFullscreen();
+                vk.recreateDisplayResources();
+                cuda.resize((int)vk.width(), (int)vk.height(),
+                            vk.interopMemoryHandle(), vk.interopAllocSize(),
+                            vk.interopBufferSize());
+                params.width  = (int)vk.width();
+                params.height = (int)vk.height();
+                params.swapRB = vk.swapRB() ? 1 : 0;
+                LOG_INFO("Render size: %dx%d%s", params.width, params.height,
+                         vk.fullscreen() ? " fullscreen" : " windowed");
+            }
+
             auto  nowT = clock::now();
             float dt   = std::chrono::duration<float>(nowT - prevT).count();
             prevT = nowT;
@@ -299,6 +321,9 @@ int main()
             handleHeldKeys(win, dt);
             if (!g.animPaused) diskTime += dt;
 
+            params.width  = (int)vk.width();
+            params.height = (int)vk.height();
+            params.swapRB = vk.swapRB() ? 1 : 0;
             if (g.bhDirty) { applyBlackHole(params); g.bhDirty = false; }
             fillCamera(params);
             params.exposure    = g.exposure;
@@ -315,8 +340,10 @@ int main()
             static bool  viewInit = false;
             static float3 pPos{}, pFwd{};
             static int   pModel = -1, pDisk = -1, pSteps = -1;
+            static int   pWidth = -1, pHeight = -1;
             static float pA = -1.f, pQ = -1.f, pPhi = -1.f;
             bool viewChanged = !viewInit
+                || pWidth != params.width || pHeight != params.height
                 || pPos.x != params.camPos.x || pPos.y != params.camPos.y
                 || pPos.z != params.camPos.z
                 || pFwd.x != params.camForward.x || pFwd.y != params.camForward.y
@@ -328,6 +355,7 @@ int main()
             pModel = params.model; pA = params.aSpin; pQ = params.Qc;
             pPhi = params.dPhi; pSteps = params.maxSteps;
             pDisk = params.diskEnabled;
+            pWidth = params.width; pHeight = params.height;
             viewInit = true;
 
             static int sampleIndex = 0;

@@ -39,6 +39,37 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         LOG_WARN("[VK-VALIDATION] %s", data->pMessage);
     return VK_FALSE;
 }
+
+GLFWmonitor* bestMonitorForWindow(GLFWwindow* window)
+{
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    glfwGetWindowPos(window, &wx, &wy);
+    glfwGetWindowSize(window, &ww, &wh);
+
+    int monitorCount = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&monitorCount);
+    GLFWmonitor* best = glfwGetPrimaryMonitor();
+    int bestArea = -1;
+
+    for (int i = 0; i < monitorCount; ++i)
+    {
+        int mx = 0, my = 0;
+        glfwGetMonitorPos(monitors[i], &mx, &my);
+        const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+        if (!mode) continue;
+
+        int overlapW = std::max(0, std::min(wx + ww, mx + mode->width) - std::max(wx, mx));
+        int overlapH = std::max(0, std::min(wy + wh, my + mode->height) - std::max(wy, my));
+        int area = overlapW * overlapH;
+        if (area > bestArea)
+        {
+            bestArea = area;
+            best = monitors[i];
+        }
+    }
+
+    return best;
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -59,10 +90,12 @@ void VulkanContext::init(uint32_t width, uint32_t height, const char* title)
         throw std::runtime_error("GLFW reports no Vulkan support (is the Vulkan runtime installed?)");
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE); // fixed 1280x720 interop buffer
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE); // windowed mode is fixed-size
     m_window = glfwCreateWindow((int)width, (int)height, title, nullptr, nullptr);
     if (!m_window)
         throw std::runtime_error("glfwCreateWindow failed");
+    glfwGetWindowPos(m_window, &m_windowedX, &m_windowedY);
+    glfwGetWindowSize(m_window, &m_windowedWidth, &m_windowedHeight);
 
     createInstance();
     createSurface();
@@ -75,7 +108,7 @@ void VulkanContext::init(uint32_t width, uint32_t height, const char* title)
     createSyncObjects();
 
     LOG_INFO("Vulkan context initialized (%ux%u, format %d, %s)",
-             width, height, (int)m_swapFormat, m_swapRB ? "BGRA" : "RGBA");
+             m_width, m_height, (int)m_swapFormat, m_swapRB ? "BGRA" : "RGBA");
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +316,8 @@ void VulkanContext::createSwapchain()
         extent.height = std::clamp(m_height, caps.minImageExtent.height, caps.maxImageExtent.height);
     }
     m_extent = extent;
+    m_width = extent.width;
+    m_height = extent.height;
 
     uint32_t imageCount = caps.minImageCount + 1;
     if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount)
@@ -331,9 +366,11 @@ void VulkanContext::destroySwapchain()
         vkDestroySwapchainKHR(m_device, m_swapchain, nullptr);
         m_swapchain = VK_NULL_HANDLE;
     }
+    m_swapImages.clear();
+    m_imagesInFlight.clear();
 }
 
-void VulkanContext::recreateSwapchain()
+void VulkanContext::updateFramebufferExtent()
 {
     int w = 0, h = 0;
     glfwGetFramebufferSize(m_window, &w, &h);
@@ -342,6 +379,60 @@ void VulkanContext::recreateSwapchain()
         glfwWaitEvents();
         glfwGetFramebufferSize(m_window, &w, &h);
     }
+    m_width = (uint32_t)w;
+    m_height = (uint32_t)h;
+}
+
+void VulkanContext::toggleFullscreen()
+{
+    if (!m_window) return;
+
+    if (!m_fullscreen)
+    {
+        glfwGetWindowPos(m_window, &m_windowedX, &m_windowedY);
+        glfwGetWindowSize(m_window, &m_windowedWidth, &m_windowedHeight);
+
+        GLFWmonitor* monitor = bestMonitorForWindow(m_window);
+        if (!monitor)
+            throw std::runtime_error("Failed to find a GLFW monitor for fullscreen");
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (!mode)
+            throw std::runtime_error("Failed to query GLFW monitor video mode");
+
+        glfwSetWindowMonitor(m_window, monitor, 0, 0,
+                             mode->width, mode->height, mode->refreshRate);
+        m_fullscreen = true;
+        LOG_INFO("Fullscreen ON: %dx%d @ %d Hz", mode->width, mode->height,
+                 mode->refreshRate);
+    }
+    else
+    {
+        glfwSetWindowMonitor(m_window, nullptr, m_windowedX, m_windowedY,
+                             m_windowedWidth, m_windowedHeight, 0);
+        m_fullscreen = false;
+        LOG_INFO("Fullscreen OFF: restored %dx%d window",
+                 m_windowedWidth, m_windowedHeight);
+    }
+
+    glfwPollEvents();
+}
+
+void VulkanContext::recreateDisplayResources()
+{
+    updateFramebufferExtent();
+    vkDeviceWaitIdle(m_device);
+    destroySwapchain();
+    destroyInteropBuffer();
+    createSwapchain();
+    createInteropBuffer();
+    createCommandBuffers();
+    m_frame = 0;
+    LOG_WARN("Display resources recreated (%ux%u)", m_width, m_height);
+}
+
+void VulkanContext::recreateSwapchain()
+{
+    updateFramebufferExtent();
     vkDeviceWaitIdle(m_device);
     destroySwapchain();
     createSwapchain();
@@ -390,6 +481,27 @@ void VulkanContext::createInteropBuffer()
 
     LOG_INFO("Interop buffer created: %zu bytes (allocation %zu)",
              m_interopBufferSize, m_interopAllocSize);
+}
+
+void VulkanContext::destroyInteropBuffer()
+{
+    if (m_interopMemHandle)
+    {
+        CloseHandle(m_interopMemHandle);
+        m_interopMemHandle = nullptr;
+    }
+    if (m_interopBuffer)
+    {
+        vkDestroyBuffer(m_device, m_interopBuffer, nullptr);
+        m_interopBuffer = VK_NULL_HANDLE;
+    }
+    if (m_interopMemory)
+    {
+        vkFreeMemory(m_device, m_interopMemory, nullptr);
+        m_interopMemory = VK_NULL_HANDLE;
+    }
+    m_interopBufferSize = 0;
+    m_interopAllocSize = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -598,9 +710,7 @@ void VulkanContext::cleanup()
     destroySwapchain();
     if (m_cmdPool) vkDestroyCommandPool(m_device, m_cmdPool, nullptr);
 
-    if (m_interopBuffer) vkDestroyBuffer(m_device, m_interopBuffer, nullptr);
-    if (m_interopMemory) vkFreeMemory(m_device, m_interopMemory, nullptr);
-    if (m_interopMemHandle) CloseHandle(m_interopMemHandle);
+    destroyInteropBuffer();
 
     if (m_device)  vkDestroyDevice(m_device, nullptr);
     if (m_debugMessenger)

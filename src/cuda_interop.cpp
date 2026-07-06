@@ -42,15 +42,11 @@ int CudaInterop::findCudaDeviceByUUID(const uint8_t uuid[16])
     return -1;
 }
 
-// ---------------------------------------------------------------------------
-void CudaInterop::init(int cudaDevice, int width, int height,
-                       HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize,
-                       HANDLE semVkToCudaHandle, HANDLE semCudaToVkHandle)
+void CudaInterop::allocateFrameResources(int width, int height)
 {
-    CUDA_CHECK(cudaSetDevice(cudaDevice));
+    if (width <= 0 || height <= 0)
+        throw std::runtime_error("Invalid CUDA frame resource size");
 
-    // Auxiliary buffers for the display-quality pipeline (device-local,
-    // CUDA-private; never copied to the CPU).
     const int bw = (width + 1) / 2, bh = (height + 1) / 2;
     CUDA_CHECK(cudaMalloc(&m_accum,  sizeof(float4) * (size_t)width * height));
     CUDA_CHECK(cudaMalloc(&m_bloomA, sizeof(float4) * (size_t)bw * bh));
@@ -58,11 +54,13 @@ void CudaInterop::init(int cudaDevice, int width, int height,
     CUDA_CHECK(cudaMemset(m_accum,  0, sizeof(float4) * (size_t)width * height));
     CUDA_CHECK(cudaMemset(m_bloomA, 0, sizeof(float4) * (size_t)bw * bh));
     CUDA_CHECK(cudaMemset(m_bloomB, 0, sizeof(float4) * (size_t)bw * bh));
-    CUDA_CHECK(cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaEventCreate(&m_evStart));
-    CUDA_CHECK(cudaEventCreate(&m_evStop));
+    m_width = width;
+    m_height = height;
+}
 
-    // ---- Import the Vulkan device memory ----
+void CudaInterop::importExternalMemory(HANDLE vkMemoryHandle, size_t allocSize,
+                                       size_t bufferSize)
+{
     cudaExternalMemoryHandleDesc memDesc{};
     memDesc.type                = cudaExternalMemoryHandleTypeOpaqueWin32;
     memDesc.handle.win32.handle = vkMemoryHandle;
@@ -73,6 +71,18 @@ void CudaInterop::init(int cudaDevice, int width, int height,
     bufDesc.offset = 0;
     bufDesc.size   = bufferSize;
     CUDA_CHECK(cudaExternalMemoryGetMappedBuffer(&m_devPtr, m_extMemory, &bufDesc));
+}
+
+// ---------------------------------------------------------------------------
+void CudaInterop::init(int cudaDevice, int width, int height,
+                       HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize,
+                       HANDLE semVkToCudaHandle, HANDLE semCudaToVkHandle)
+{
+    CUDA_CHECK(cudaSetDevice(cudaDevice));
+
+    CUDA_CHECK(cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreate(&m_evStart));
+    CUDA_CHECK(cudaEventCreate(&m_evStop));
 
     // ---- Import the Vulkan semaphores ----
     cudaExternalSemaphoreHandleDesc semDesc{};
@@ -82,8 +92,53 @@ void CudaInterop::init(int cudaDevice, int width, int height,
     semDesc.handle.win32.handle = semCudaToVkHandle;
     CUDA_CHECK(cudaImportExternalSemaphore(&m_semCudaToVk, &semDesc));
 
+    resize(width, height, vkMemoryHandle, allocSize, bufferSize);
     LOG_INFO("CUDA interop initialized: mapped %zu bytes of Vulkan memory at %p",
              bufferSize, m_devPtr);
+}
+
+void CudaInterop::releaseFrameResources()
+{
+    sync();
+    if (m_devPtr)
+    {
+        CUDA_CHECK(cudaFree(m_devPtr));
+        m_devPtr = nullptr;
+    }
+    if (m_accum)
+    {
+        CUDA_CHECK(cudaFree(m_accum));
+        m_accum = nullptr;
+    }
+    if (m_bloomA)
+    {
+        CUDA_CHECK(cudaFree(m_bloomA));
+        m_bloomA = nullptr;
+    }
+    if (m_bloomB)
+    {
+        CUDA_CHECK(cudaFree(m_bloomB));
+        m_bloomB = nullptr;
+    }
+    if (m_extMemory)
+    {
+        CUDA_CHECK(cudaDestroyExternalMemory(m_extMemory));
+        m_extMemory = nullptr;
+    }
+    m_width = 0;
+    m_height = 0;
+}
+
+void CudaInterop::resize(int width, int height,
+                         HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize)
+{
+    releaseFrameResources();
+    allocateFrameResources(width, height);
+    importExternalMemory(vkMemoryHandle, allocSize, bufferSize);
+    m_frames = 0;
+    m_lastKernelMs = 0.f;
+    LOG_INFO("CUDA frame resources resized: %dx%d, mapped %zu bytes at %p",
+             width, height, bufferSize, m_devPtr);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +178,14 @@ void CudaInterop::sync()
 
 void CudaInterop::cleanup()
 {
-    sync();
-    if (m_devPtr)      cudaFree(m_devPtr);
-    if (m_accum)       cudaFree(m_accum);
-    if (m_bloomA)      cudaFree(m_bloomA);
-    if (m_bloomB)      cudaFree(m_bloomB);
-    if (m_extMemory)   cudaDestroyExternalMemory(m_extMemory);
+    try
+    {
+        releaseFrameResources();
+    }
+    catch (const std::exception& e)
+    {
+        LOG_WARN("CUDA frame resource cleanup failed: %s", e.what());
+    }
     if (m_semVkToCuda) cudaDestroyExternalSemaphore(m_semVkToCuda);
     if (m_semCudaToVk) cudaDestroyExternalSemaphore(m_semCudaToVk);
     if (m_evStart)     cudaEventDestroy(m_evStart);
@@ -138,6 +195,9 @@ void CudaInterop::cleanup()
     m_accum = m_bloomA = m_bloomB = nullptr;
     m_extMemory = nullptr;
     m_semVkToCuda = m_semCudaToVk = nullptr;
+    m_evStart = m_evStop = nullptr;
     m_stream = nullptr;
+    m_frames = 0;
+    m_lastKernelMs = 0.f;
     LOG_INFO("CUDA interop destroyed");
 }

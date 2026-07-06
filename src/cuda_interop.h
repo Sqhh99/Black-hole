@@ -38,6 +38,9 @@ public:
               HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize,
               HANDLE semVkToCudaHandle,   // CUDA waits on this
               HANDLE semCudaToVkHandle);  // CUDA signals this
+    void releaseFrameResources();
+    void resize(int width, int height,
+                HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize);
     void cleanup();
 
     // Enqueues (optional) wait, the render kernel, timing events and the
@@ -48,6 +51,10 @@ public:
     void sync(); // full stream sync (used at shutdown)
 
 private:
+    void allocateFrameResources(int width, int height);
+    void importExternalMemory(HANDLE vkMemoryHandle, size_t allocSize,
+                              size_t bufferSize);
+
     cudaStream_t            m_stream      = nullptr;
     cudaExternalMemory_t    m_extMemory   = nullptr;
     void*                   m_devPtr      = nullptr;
@@ -60,4 +67,6 @@ private:
     float4*                 m_bloomB      = nullptr; // half-res bloom pong
     uint64_t                m_frames      = 0;
     float                   m_lastKernelMs = 0.f;
+    int                     m_width       = 0;
+    int                     m_height      = 0;
 };

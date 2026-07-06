@@ -36,6 +36,12 @@ public:
 
     GLFWwindow* window() const { return m_window; }
     bool        swapRB() const { return m_swapRB; }
+    uint32_t    width()  const { return m_width; }
+    uint32_t    height() const { return m_height; }
+    bool        fullscreen() const { return m_fullscreen; }
+
+    void toggleFullscreen();
+    void recreateDisplayResources();
 
     // --- CUDA interop exports ---
     HANDLE         interopMemoryHandle() const { return m_interopMemHandle; }
@@ -60,9 +66,11 @@ private:
     void destroySwapchain();
     void recreateSwapchain();
     void createInteropBuffer();
+    void destroyInteropBuffer();
     void createInteropSemaphores();
     void createCommandBuffers();
     void createSyncObjects();
+    void updateFramebufferExtent();
 
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
 
@@ -77,6 +85,11 @@ private:
     uint32_t                 m_queueFamily   = 0;
     uint8_t                  m_deviceUUID[16] = {};
     bool                     m_validation    = false;
+    bool                     m_fullscreen    = false;
+    int                      m_windowedX     = 100;
+    int                      m_windowedY     = 100;
+    int                      m_windowedWidth = 1280;
+    int                      m_windowedHeight = 720;
 
     // --- swapchain ---
     VkSwapchainKHR           m_swapchain     = VK_NULL_HANDLE;

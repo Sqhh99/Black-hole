@@ -77,6 +77,7 @@ for SM 61/75/86/89).
 | `,` / `.` | Charge q down / up (RN, Kerr–Newman; hold to repeat) |
 | `B` | Toggle HDR bloom |
 | `F1` | Toggle accretion disk |
+| `F11` | Toggle native fullscreen on the current monitor |
 | `SPACE` | Pause / resume disk animation |
 | `ESC` | Quit |
 
@@ -296,8 +297,9 @@ step-halving convergence) passes unchanged on the optimized code.
   Boyer–Lindquist embedding (negligible at camera distances ≥ 2.2 units).
 - The disk is a phenomenological model (thin-disk temperature law + noise),
   not a GRMHD simulation.
-- Fixed, non-resizable 1280×720 window (change `kWidth`/`kHeight` in
-  `src/main.cpp` and rebuild).
+- Windowed mode is fixed at 1280×720; `F11` switches to native fullscreen
+  on the current monitor and renders at that fullscreen resolution, increasing
+  GPU cost accordingly.
 - Binary-semaphore ping-pong serializes CUDA and Vulkan per frame (no
   multi-frame kernel pipelining).
 - Single-GPU NVIDIA only; hybrid laptops must run the app on the NVIDIA GPU
