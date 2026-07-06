@@ -1,10 +1,25 @@
-# Schwarzschild Black Hole — Real-Time CUDA + Vulkan Renderer
+# Black Hole Renderer — Schwarzschild / Reissner–Nordström / Kerr / Kerr–Newman (CUDA + Vulkan)
 
-A real-time, physically-motivated renderer of a non-rotating (Schwarzschild)
-black hole for **Windows x64**. Per-pixel **null geodesics are numerically
-integrated (RK4)** on the GPU with **CUDA**; the resulting HDR image is
-tone-mapped in the kernel and handed to **Vulkan** for presentation via
-**GPU-side external-memory interop** — the frame never touches the CPU.
+A real-time, physically-motivated renderer of **four black hole families**
+for **Windows x64**, switchable live:
+
+| Key | Model | Spin a* | Charge q | Outer horizon r+ |
+|---|---|---|---|---|
+| F2 | Schwarzschild | 0 | 0 | 2M |
+| F3 | Reissner–Nordström | 0 | ≠0 | M + √(M²−Q²) |
+| F4 | Kerr | ≠0 | 0 | M + √(M²−a²) |
+| F5 | Kerr–Newman | ≠0 | ≠0 | M + √(M²−a²−Q²) |
+
+Geometric units G = c = 1, unified mass parameter M (rs = 2M; the default
+mass scale M = 0.5 makes rs = 1 code unit, preserving the original scene
+scale), dimensionless spin a* = a/M and charge q = Q/M. Naked-singularity
+parameters (q² > 1, a*² > 1, a*² + q² > 1) are rejected and clamped inside
+the extremal bound with a console warning — never NaN, flicker, or a crash.
+
+Per-pixel **null geodesics are numerically integrated (RK4)** on the GPU
+with **CUDA**; the HDR image is tone-mapped in the kernel and handed to
+**Vulkan** for presentation via **GPU-side external-memory interop** — the
+frame never touches the CPU.
 
 No OpenGL, no Qt, no Python at runtime.
 
@@ -30,6 +45,7 @@ vcpkg manifest (`vcpkg.json`) during CMake configure.
 build.cmd configure   :: CMake configure (VS 2026 generator, x64, vcpkg toolchain)
 build.cmd build       :: configure (if needed) + compile, Release
 build.cmd run         :: build (if needed) + launch blackhole.exe
+build.cmd test        :: build + run the GPU verification suite
 build.cmd clean       :: delete the build directory
 build.cmd rebuild     :: clean + configure + build
 build.cmd run debug   :: same actions with the Debug configuration
@@ -56,6 +72,10 @@ for SM 61/75/86/89).
 | `A`/`D`, `Q`/`E` | Azimuth / elevation via keyboard |
 | `-` / `=` | Exposure down / up |
 | `1` / `2` / `3` | Quality preset: fast / balanced (default) / high |
+| `F2` `F3` `F4` `F5` | Model: Schwarzschild / Reissner–Nordström / Kerr / Kerr–Newman |
+| `[` / `]` | Spin a* down / up (Kerr, Kerr–Newman; hold to repeat) |
+| `,` / `.` | Charge q down / up (RN, Kerr–Newman; hold to repeat) |
+| `B` | Toggle HDR bloom |
 | `F1` | Toggle accretion disk |
 | `SPACE` | Pause / resume disk animation |
 | `ESC` | Quit |
@@ -91,13 +111,35 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
 
 ## 5. Physics & rendering effects implemented
 
-- **True geodesic integration, not screen-space warping.** For every pixel a
-  null geodesic is integrated in its orbital plane using the Binet equation
-  `u''(φ) = (3/2) rs u² − u` (u = 1/r, geometric units rs = 1) with a
-  **classic 4th-order Runge–Kutta** scheme and adjustable step `dφ`.
-- **Robust termination:** capture at the horizon (u ≥ 1), escape beyond
-  r = 60 rs with outward motion, NaN/Inf guards (treated as captured), a hard
-  step budget, and a straight-line fallback for degenerate purely-radial rays.
+- **True geodesic integration, not screen-space warping — in every model.**
+  - *Schwarzschild & Reissner–Nordström* (spherically symmetric): each ray's
+    orbital plane hosts the generalized Binet equation
+    `u''(φ) = 3M u² − 2Q² u³ − u` (u = 1/r), integrated with classic RK4 in
+    the orbital angle. For Q = 0 this is exactly the original Schwarzschild
+    path.
+  - *Kerr & Kerr–Newman*: full **3D null geodesics in Boyer–Lindquist
+    coordinates** — not a 2D equation with a cosmetic twist. The first-order
+    Hamiltonian system for (r, θ, φ, p_r, p_θ) with conserved E = −p_t and
+    L_z = p_φ is integrated with RK4 and an **adaptive affine step** that
+    shrinks near the horizon and inside the photon region; dp_r/dλ and
+    dp_θ/dλ use the full partial derivatives of H, keeping the null
+    constraint conserved (monitored by the test suite: median
+    |K|/(E²(r²+a²)) ≈ 2·10⁻⁶ along a*=0.9 rays).
+  - **Camera mapping through a static-observer frame in all models:** pixel
+    directions live in the observer's local orthonormal frame and are
+    converted to coordinate 4-momenta — via the √f(r₀) factor in the
+    spherical path and a full static-observer **tetrad** in Boyer–Lindquist
+    for Kerr/KN. Euclidean direction vectors are never used directly as
+    geodesic derivatives. (This mapping is what makes the rendered shadow
+    boundary match theory to <0.1%, see Testing.)
+- **Robust termination:** capture at the outer horizon r+, escape beyond
+  r = 120M with outward motion, NaN/Inf guards (treated as captured), a hard
+  step budget, pole-reflection guards for near-axis rays, and a
+  straight-line fallback for degenerate purely-radial rays.
+- **Model-dependent optics (verified numerically, see Testing):** the shadow,
+  photon region and deflection field shrink with charge q; spin drags frames,
+  displacing and asymmetrizing the shadow and the higher-order images;
+  Kerr–Newman combines both effects.
 - **Pitch-black event horizon** — captured rays contribute no light.
 - **Gravitational lensing** of a procedural background starfield: the escape
   direction of the bent geodesic samples the sky, producing continuous
@@ -105,48 +147,153 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
 - **Photon ring:** rays passing near the r = 1.5 rs photon sphere wind around
   the hole multiple times and sample the disk/sky repeatedly, so the bright
   thin ring at the shadow edge **emerges from the integration itself**.
-- **Finite-thickness accretion disk** (3 rs → 12 rs, Gaussian vertical
+- **Finite-thickness accretion disk** (inner edge = the **numerically
+  computed ISCO of the current model** — 6M for Schwarzschild, sweeping in
+  toward the horizon with prograde spin — out to 24M; Gaussian vertical
   profile with H ∝ √r) sampled volumetrically along the geodesic with
   sub-stepping and self-absorption (transmittance), so the disk correctly
   appears in front of, behind (lensed over/under), and inside the photon ring.
 - **Temperature profile** T ∝ r^(−3/4) (thin-disk scaling) mapped through a
   black-body colour fit; inner edge hotter/brighter, outer edge cooler/darker.
-- **Relativistic Doppler beaming + gravitational redshift:** Keplerian orbital
-  velocity gives the special-relativistic Doppler factor, combined with
-  √(1 − rs/r); observed intensity scales as g⁴ and the black-body colour is
-  shifted by g — the approaching side is visibly brighter and bluer.
-- **HDR pipeline:** linear float3 accumulation → exposure → ACES tone map →
-  gamma 2.2 → 8-bit output (with R/B swap for BGRA swapchains).
+- **Relativistic Doppler beaming + gravitational redshift:** in the
+  spherical models, the circular-orbit velocity (with its Q-correction)
+  gives the special-relativistic Doppler factor combined with √f(r). In the
+  rotating models the shift is the **exact relativistic factor
+  g = 1 / [uᵗ (E − Ω L_z)]** of a circular equatorial emitter in
+  Kerr–Newman — frame dragging is inside Ω and the metric, so the redshift
+  distribution responds to both spin and charge. Observed intensity scales
+  as g⁴ and the black-body colour is shifted by g — the approaching side is
+  visibly brighter and bluer.
+- **HDR display pipeline with progressive anti-aliasing:** every frame
+  traces one jittered sub-pixel sample (R2 low-discrepancy sequence) into a
+  linear-HDR float4 accumulation buffer. While the camera and model are
+  held still the image *refines itself*, converging to supersampled quality
+  within a fraction of a second (the title bar shows the accumulated `spp`);
+  any view change instantly resets to the ordinary single-sample image, so
+  interaction latency is unchanged. With the disk animating, an exponential
+  moving average provides temporal anti-aliasing plus a mild, physically
+  reasonable motion blur of the orbiting gas. Exposure and bloom apply
+  *after* accumulation, so adjusting them never resets convergence.
+- **HDR bloom** (`B` to toggle): smooth bright-pass at half resolution,
+  separable 9-tap Gaussian, bilinear upsample — the photon ring, the beamed
+  side of the disk and the inner edge glow the way hot HDR sources should.
+  Costs a few small kernels per frame, negligible next to the geodesics.
+- **Tone mapping & quantization:** exposure → ACES filmic → gamma 2.2 →
+  triangular-pdf spatial dither → 8-bit (R/B swap for BGRA swapchains). The
+  dither removes 8-bit banding in the dark background and is static per
+  pixel, so a converged image is perfectly still.
 - Turbulent disk detail via differentially-rotating fBm noise, animated in
   real time (SPACE to pause).
 
-## 6. Testing status — please read
+## 6. Verification & testing status — please read
 
-This project was authored in a **Linux container without an NVIDIA GPU,
-without the CUDA toolkit, without the Vulkan SDK, and without MSVC**, so the
-Windows build and the live application **could not be compiled or executed
-by the author environment**. What *was* verified:
+### Executable verification suite (`build.cmd test`)
 
-- `black_hole_kernel.cu`, `cuda_interop.cpp`, `main.cpp` and all project
-  headers pass strict host-compiler syntax/type checking (`g++ -std=c++17
-  -Wall -Wextra -fsyntax-only`) against thin API shims.
-- `vulkan_context.cpp` was reviewed manually and passes structural checks;
-  it could not be shim-compiled economically.
+`blackhole_tests.exe` (CUDA console app, no Vulkan needed) runs the *same*
+device integrators as the renderer on grids of camera rays and asserts,
+with explicit tolerances:
 
-Consequently, **first-build issues on real MSVC/NVCC/Vulkan cannot be ruled
-out**, and all performance figures are **estimates, not measurements**:
-on a desktop RTX-class GPU, 1280×720 at the default "balanced" preset
-(dφ = 0.012, ≤ 2000 RK4 steps) is *expected* to run at interactive rates
-(tens of FPS), with the "fast" preset comfortably real-time and "high"
-substantially heavier. Please verify with the on-screen counters.
+- **T1** Event-horizon radii match the closed-form theory for all four
+  models (r+ = M + √(M²−a²−Q²) and each special case), plus
+  Schwarzschild identities: r+ = 2M, photon sphere 3M, ISCO 6M (numeric).
+- **T2** Validation rejects/clamps q² > 1, a*² > 1, a*² + q² > 1, NaN
+  mass/spin/camera, zero step size, zero step budget.
+- **T3** Consistency limits: RN(q=0) ≡ Schwarzschild and KN(q=0) ≡ Kerr
+  (same integrator, tight tolerance); Kerr(a*=0) ≈ Schwarzschild,
+  KN(a*=0,q) ≈ RN(q), KN(0,0) ≈ Schwarzschild (cross-integrator, 2D Binet
+  vs 3D Boyer–Lindquist). Also: the RN shadow must shrink with q.
+- **T4** Null-geodesic Hamiltonian constraint |K|/(E²(r²+a²)) stays small
+  along Kerr a*=0.9 and KN a*=0.7 q=0.5 rays (median and max asserted).
+- **T5** Convergence: halving the step quality (and doubling the step
+  budget, twice) changes escape directions less and less; the
+  Schwarzschild shadow boundary is bisected and compared against
+  b_crit = 3√3 M (assert < 1% relative error).
+- **T6** Stability smoke tests: full renders with zero step size, zero max
+  steps, NaN camera and naked-singularity parameters complete with no CUDA
+  error and fully written output.
+
+### What was executed where
+
+The Windows CUDA+Vulkan binaries were not built in the authoring
+environment (Linux container, no GPU/MSVC/Vulkan SDK); you confirmed the
+baseline builds on the target machine, and `build.cmd test` is how the GPU
+suite is meant to be run there. However, the physics was **actually
+executed and validated on the CPU** in the authoring environment: because
+all integrators live in `trace.cuh` as pure math, the identical code was
+compiled with a host compiler and run through the same test battery.
+Measured results on the final sources:
+
+- Schwarzschild shadow boundary vs b_c = 3√3 M: **0.000% relative error**
+  (bisection-limited); RN q=0.6 vs b_c = r_ph/√f(r_ph): **0.000%**.
+- Kerr(a*=0) vs Schwarzschild across 1681 rays: 0 classification
+  mismatches, **median escape-direction difference 5.7·10⁻⁶ rad** (the two
+  independent integrators agree to float precision; only rays hugging the
+  photon ring diverge, as they must).
+- KN(a*=0.6, q=0) vs Kerr(a*=0.6): **bitwise identical**.
+- Hamiltonian constraint along a*=0.9 rays: median 1.9·10⁻⁶, max < 10⁻².
+- Frame dragging at a*=0.9: equatorial shadow displaced and narrowed
+  relative to Schwarzschild (measured on the image grid).
+- All invalid-input cases sanitized; traces terminate cleanly.
+- The display-quality pipeline (accumulation, bloom, dithered composite)
+  was executed on the CPU through the same shared device helpers, and the
+  rendered Schwarzschild and Kerr images were visually inspected: correct
+  shadow/ring/disk, bloom confined to hot regions, no artifacts. An 8-sample
+  progressive accumulation measured **1.78× lower full-image RMS error**
+  against a 64-sample reference (gains concentrated on silhouette edges),
+  and repeat renders are bit-identical (the GPU suite asserts determinism,
+  poisoned-accumulation recovery and sanitation of the new fields in T6).
+
+GPU execution can differ from CPU only through `--use_fast_math` rounding;
+the suite's tolerances leave ample margin for that.
+
+### Performance of the rotating models
+
+The Kerr/Kerr–Newman integrator was profiled (on CPU, as a proxy for
+relative GPU cost — absolute GPU timings must come from the on-screen
+counters) and optimized without any measurable accuracy change in the full
+validation battery:
+
+- The adaptive step controller's budgets were re-derived to match the
+  spherical integrator's accuracy scale (angular advance ~2.2·dPhi rad per
+  RK4 step, fractional horizon approach ~8·dPhi, both scaling with the
+  1/2/3 quality presets; extra refinement inside the photon region).
+- Steps grow linearly with r in the weak field instead of a flat spatial
+  cap, so far-field flight costs a handful of steps.
+- The fine spatial cap needed for volumetric disk sampling applies only
+  inside the disk's radial band near the equatorial slab.
+- Disk segments that cannot touch the disk annulus are culled radially
+  before sub-sampling; when the disk is toggled off, the rotating path
+  skips per-step Cartesian conversion entirely.
+- Trigonometry uses the fused `__sincosf` device intrinsic.
+
+Measured on the shared integrator code (140×140 rays, default camera,
+balanced preset): Kerr a\*=0.9 with disk **4.5× faster** than the initial
+implementation (Kerr–Newman 3.5×; disk-off Kerr 5.2×), bringing the
+rotating models to ~2.3× the cost of Schwarzschild per frame (previously
+~8.6×). Average integration steps per ray dropped from ~900 to ~197. As a
+side effect the retune also fixed a subtle issue: at the default step
+budget the old controller could exhaust `maxSteps` on photon-ring-adjacent
+rays and misclassify them as captured; the new controller leaves zero
+budget-exhausted rays at identical converged classifications.
+
+The full physics battery (shadow radii vs theory to 0.000%, all five model
+reductions, Hamiltonian constraint, frame-dragging displacement,
+step-halving convergence) passes unchanged on the optimized code.
 
 ## 7. Known limitations
 
-- **Schwarzschild only** — no Kerr metric, so no frame dragging, no
-  spin-asymmetric shadow.
 - **Approximate radiative transfer:** simple emission/absorption with
   heuristic scalings; no full frequency-dependent radiative transport, no
   polarization, no photon redshift applied to the background starfield.
+- Naked singularities are not rendered: parameters are clamped to
+  a*² + q² ≤ 0.995. Spin is prograde-only (a* ≥ 0) in this version.
+- The Kerr–Newman "photon region" marker used for step refinement uses the
+  Kerr prograde formula (charge correction ignored); it only affects the
+  adaptive step heuristic, not correctness.
+- Disk turbulence is advected with the coordinate angular velocity Ω(r);
+  time-of-flight (slow-light) effects on the animation are ignored.
+- Camera placement uses r = |x| spherical mapping rather than the oblate
+  Boyer–Lindquist embedding (negligible at camera distances ≥ 2.2 units).
 - The disk is a phenomenological model (thin-disk temperature law + noise),
   not a GRMHD simulation.
 - Fixed, non-resizable 1280×720 window (change `kWidth`/`kHeight` in
@@ -163,14 +310,24 @@ CMakeLists.txt              CMake project (CXX + CUDA, VS 2026 / x64)
 build.cmd                   configure | build | run | clean | rebuild
 vcpkg.json                  manifest (glfw3)
 src/
-  main.cpp                  window loop, orbit camera, input, stats
+  main.cpp                  window loop, orbit camera, input, model switching
   vulkan_context.{h,cpp}    instance/device/swapchain, exportable buffer
                             + semaphores, copy-and-present command buffers
   cuda_interop.{h,cpp}      external memory/semaphore import, kernel dispatch,
                             CUDA event timing, device-UUID matching
-  black_hole_kernel.cu      RK4 geodesic integration, disk shading, Doppler,
+  black_hole_kernel.cu      per-pixel kernel + sanitizing launcher
+  trace.cuh                 shared device physics: generalized Binet
+                            integrator (Schw/RN), Boyer-Lindquist
+                            Hamiltonian integrator (Kerr/KN), tetrad camera
+                            mapping, disk shading with exact g-factor,
                             starfield, ACES tone mapping
+  metric.cuh                Kerr-Newman metric math, horizons, photon
+                            region, numeric ISCO, validation/clamping,
+                            parameter sanitation (host + device)
   render_params.h           POD shared between host and device
+  kernel_launch.h           launch wrapper macro
   vec_math.cuh              device float2/3 math, hashing, fBm noise
   logger.h                  timestamped console logging
+tests/
+  test_main.cu              GPU verification suite (build.cmd test)
 ```

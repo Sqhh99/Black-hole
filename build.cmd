@@ -7,6 +7,7 @@ rem   build.cmd                 configure + build (Release)
 rem   build.cmd configure       configure only
 rem   build.cmd build           configure (if needed) + build
 rem   build.cmd run             build + run
+rem   build.cmd test            build + run the GPU verification suite
 rem   build.cmd clean           remove the build directory
 rem   build.cmd rebuild         clean + configure + build
 rem   build.cmd <action> debug  use the Debug configuration
@@ -61,7 +62,8 @@ if /I "%ACTION%"=="rebuild" goto :rebuild
 if /I "%ACTION%"=="configure" goto :configure
 if /I "%ACTION%"=="build"   goto :build
 if /I "%ACTION%"=="run"     goto :run
-echo [ERROR] Unknown action "%ACTION%". Use configure ^| build ^| run ^| clean ^| rebuild.
+if /I "%ACTION%"=="test"    goto :test
+echo [ERROR] Unknown action "%ACTION%". Use configure ^| build ^| run ^| test ^| clean ^| rebuild.
 exit /b 1
 
 rem ---------------------------------------------------------------------------
@@ -92,6 +94,7 @@ if errorlevel 1 (
 echo [INFO] Build succeeded: "%BUILD_DIR%\%CONFIG%\blackhole.exe"
 if /I "%ACTION%"=="build" exit /b 0
 if /I "%ACTION%"=="rebuild" exit /b 0
+if /I "%ACTION%"=="test" goto :dotest
 goto :dorun
 
 rem ---------------------------------------------------------------------------
@@ -100,6 +103,20 @@ if not exist "%BUILD_DIR%\%CONFIG%\blackhole.exe" goto :build
 :dorun
 echo [INFO] Running blackhole.exe ...
 "%BUILD_DIR%\%CONFIG%\blackhole.exe"
+exit /b %errorlevel%
+
+rem ---------------------------------------------------------------------------
+:test
+if not exist "%BUILD_DIR%\CMakeCache.txt" goto :configure
+echo [INFO] Building verification suite (%CONFIG%) ...
+cmake --build "%BUILD_DIR%" --config %CONFIG% --target blackhole_tests --parallel
+if errorlevel 1 (
+    echo [ERROR] Test build failed.
+    exit /b 1
+)
+:dotest
+echo [INFO] Running blackhole_tests.exe ...
+"%BUILD_DIR%\%CONFIG%\blackhole_tests.exe"
 exit /b %errorlevel%
 
 rem ---------------------------------------------------------------------------

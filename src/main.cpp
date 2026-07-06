@@ -12,6 +12,10 @@
 //   Q,E ..................... elevation
 //   -,= ..................... exposure down / up
 //   1,2,3 ................... quality preset (fast / balanced / high)
+//   F2,F3,F4,F5 ............. model: Schwarzschild / Reissner-Nordstrom /
+//                             Kerr / Kerr-Newman
+//   [ , ] ................... spin a* down / up      (Kerr, Kerr-Newman)
+//   , . ................... charge q down / up     (RN, Kerr-Newman)
 //   F1 ...................... toggle accretion disk
 //   SPACE ................... pause / resume disk animation
 //   ESC ..................... quit
@@ -19,6 +23,7 @@
 #include "vulkan_context.h"
 #include "cuda_interop.h"
 #include "render_params.h"
+#include "metric.cuh"
 #include "logger.h"
 
 #include <chrono>
@@ -49,9 +54,57 @@ struct AppState
     int    maxSteps   = 2000;
     double lastX = 0.0, lastY = 0.0;
     bool   dragging = false;
+
+    // Black hole model knobs. aStar/q are the user's stored settings; each
+    // model applies only the parameters that pertain to it (Schwarzschild
+    // ignores both, RN ignores spin, Kerr ignores charge).
+    int    model   = BH_SCHWARZSCHILD;
+    float  aStar   = 0.70f;
+    float  q       = 0.40f;
+    bool   bhDirty = true;
+
+    bool   bloomOn = true;   // HDR bloom of the disk / photon ring
 };
 
 AppState g;
+
+// Validate the current model/spin/charge, derive horizon / photon-region /
+// ISCO, and push everything into the shared parameter block.
+void applyBlackHole(RenderParams& p)
+{
+    if (g.aStar < 0.f) g.aStar = 0.f;
+    if (g.aStar > 0.995f) g.aStar = 0.995f;
+    if (g.q < 0.f) g.q = 0.f;
+    if (g.q > 0.995f) g.q = 0.995f;
+
+    float M = 0.5f;                 // mass scale: rs = 2M = 1 code unit
+    float aS = g.aStar, qq = g.q;
+    BHDerived d = bhValidateAndDerive(g.model, M, aS, qq);
+    if (d.clamped) { g.aStar = aS; g.q = qq; }
+
+    p.model     = g.model;
+    p.M         = M;
+    p.aSpin     = d.a;
+    p.Qc        = d.Q;
+    p.rPlus     = d.rPlus;
+    p.rPhoton   = d.rPhoton;
+    p.rErgo     = d.rErgo;
+    p.diskInner = d.rIsco;          // disk inner edge tracks the ISCO
+    p.diskOuter = 12.0f;            // 24M
+
+    bool useA = (g.model == BH_KERR || g.model == BH_KERR_NEWMAN);
+    bool useQ = (g.model == BH_REISSNER_NORDSTROM || g.model == BH_KERR_NEWMAN);
+    char aStr[16], qStr[16];
+    if (useA) std::snprintf(aStr, sizeof(aStr), "%.3f", g.aStar);
+    else      std::snprintf(aStr, sizeof(aStr), "-");
+    if (useQ) std::snprintf(qStr, sizeof(qStr), "%.3f", g.q);
+    else      std::snprintf(qStr, sizeof(qStr), "-");
+    LOG_INFO("%s | M=%.2f  a*=%s  q=%s | r+=%.4f  r_photon=%.4f  "
+             "r_ergo=%.4f  ISCO=%.4f%s",
+             bhModelName(g.model), M, aStr, qStr,
+             d.rPlus, d.rPhoton, d.rErgo, d.rIsco,
+             d.clamped ? "  [parameters clamped to the extremal bound]" : "");
+}
 
 void clampCamera()
 {
@@ -124,13 +177,33 @@ void onScroll(GLFWwindow*, double, double yoff)
 
 void onKey(GLFWwindow* w, int key, int, int action, int)
 {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+
+    // Repeat-friendly parameter adjustment
+    switch (key)
+    {
+    case GLFW_KEY_LEFT_BRACKET:  g.aStar -= 0.05f; g.bhDirty = true; return;
+    case GLFW_KEY_RIGHT_BRACKET: g.aStar += 0.05f; g.bhDirty = true; return;
+    case GLFW_KEY_COMMA:         g.q     -= 0.05f; g.bhDirty = true; return;
+    case GLFW_KEY_PERIOD:        g.q     += 0.05f; g.bhDirty = true; return;
+    default: break;
+    }
+
     if (action != GLFW_PRESS) return;
     switch (key)
     {
     case GLFW_KEY_ESCAPE: glfwSetWindowShouldClose(w, GLFW_TRUE); break;
+    case GLFW_KEY_F2: g.model = BH_SCHWARZSCHILD;      g.bhDirty = true; break;
+    case GLFW_KEY_F3: g.model = BH_REISSNER_NORDSTROM; g.bhDirty = true; break;
+    case GLFW_KEY_F4: g.model = BH_KERR;               g.bhDirty = true; break;
+    case GLFW_KEY_F5: g.model = BH_KERR_NEWMAN;        g.bhDirty = true; break;
     case GLFW_KEY_F1:
         g.diskOn = !g.diskOn;
         LOG_INFO("Accretion disk %s", g.diskOn ? "ON" : "OFF");
+        break;
+    case GLFW_KEY_B:
+        g.bloomOn = !g.bloomOn;
+        LOG_INFO("Bloom %s", g.bloomOn ? "ON" : "OFF");
         break;
     case GLFW_KEY_SPACE:
         g.animPaused = !g.animPaused;
@@ -178,7 +251,7 @@ int main()
                 "CUDA-Vulkan interop requires rendering and presenting on the "
                 "same NVIDIA GPU.");
 
-        cuda.init(cudaDev,
+        cuda.init(cudaDev, (int)kWidth, (int)kHeight,
                   vk.interopMemoryHandle(), vk.interopAllocSize(), vk.interopBufferSize(),
                   vk.semVkToCudaHandle(), vk.semCudaToVkHandle());
 
@@ -190,11 +263,17 @@ int main()
 
         LOG_INFO("Controls: LMB drag=orbit  wheel/W/S=zoom  A/D/Q/E=rotate  "
                  "-/= exposure  1/2/3 quality  F1 disk  SPACE pause  ESC quit");
+        LOG_INFO("Models:   F2 Schwarzschild  F3 Reissner-Nordstrom  F4 Kerr  "
+                 "F5 Kerr-Newman  |  [/] spin a*  ,/. charge q  |  B bloom");
+        LOG_INFO("Quality:  hold the camera still and the image refines "
+                 "itself (progressive anti-aliasing)");
 
         RenderParams params;
         params.width  = (int)kWidth;
         params.height = (int)kHeight;
         params.swapRB = vk.swapRB() ? 1 : 0;
+        applyBlackHole(params);
+        g.bhDirty = false;
 
         using clock = std::chrono::steady_clock;
         auto  prevT      = clock::now();
@@ -220,12 +299,43 @@ int main()
             handleHeldKeys(win, dt);
             if (!g.animPaused) diskTime += dt;
 
+            if (g.bhDirty) { applyBlackHole(params); g.bhDirty = false; }
             fillCamera(params);
             params.exposure    = g.exposure;
             params.diskEnabled = g.diskOn ? 1 : 0;
             params.diskTime    = diskTime;
             params.dPhi        = g.dPhi;
             params.maxSteps    = g.maxSteps;
+            params.bloomEnabled = g.bloomOn ? 1 : 0;
+
+            // --- Progressive temporal anti-aliasing bookkeeping ---------
+            // Anything that changes the rendered geometry resets the
+            // accumulation; exposure and bloom are applied after
+            // accumulation and therefore do NOT reset it.
+            static bool  viewInit = false;
+            static float3 pPos{}, pFwd{};
+            static int   pModel = -1, pDisk = -1, pSteps = -1;
+            static float pA = -1.f, pQ = -1.f, pPhi = -1.f;
+            bool viewChanged = !viewInit
+                || pPos.x != params.camPos.x || pPos.y != params.camPos.y
+                || pPos.z != params.camPos.z
+                || pFwd.x != params.camForward.x || pFwd.y != params.camForward.y
+                || pFwd.z != params.camForward.z
+                || pModel != params.model || pA != params.aSpin
+                || pQ != params.Qc || pPhi != params.dPhi
+                || pSteps != params.maxSteps || pDisk != params.diskEnabled;
+            pPos = params.camPos; pFwd = params.camForward;
+            pModel = params.model; pA = params.aSpin; pQ = params.Qc;
+            pPhi = params.dPhi; pSteps = params.maxSteps;
+            pDisk = params.diskEnabled;
+            viewInit = true;
+
+            static int sampleIndex = 0;
+            if (viewChanged) sampleIndex = 0;
+            params.sampleIndex = sampleIndex;
+            params.accumMode = viewChanged ? 0
+                             : ((g.animPaused || !g.diskOn) ? 1 : 2);
+            if (sampleIndex < 4096) ++sampleIndex;
 
             // 1) CUDA renders into the shared Vulkan buffer (GPU-side sync)
             float kernelMs = cuda.render(params, frame > 0);
@@ -251,9 +361,12 @@ int main()
                 double avgP = statPresent / statFrames;
                 char title[256];
                 std::snprintf(title, sizeof(title),
-                              "Schwarzschild Black Hole | %.1f FPS | CUDA kernel %.2f ms | "
-                              "VK present %.2f ms | r=%.1f rs | exp %.2f",
-                              fps, avgK, avgP, g.cam.distance, g.exposure);
+                              "%s Black Hole | a*=%.2f q=%.2f | %.1f FPS | "
+                              "CUDA %.2f ms | VK %.2f ms | spp %d | r=%.1f | exp %.2f",
+                              bhModelName(g.model),
+                              params.aSpin / params.M, params.Qc / params.M,
+                              fps, avgK, avgP,
+                              params.sampleIndex + 1, g.cam.distance, g.exposure);
                 glfwSetWindowTitle(win, title);
 
                 static int consoleDiv = 0;

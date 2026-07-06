@@ -19,8 +19,10 @@
     } while (0)
 
 // Implemented in black_hole_kernel.cu
-extern "C" cudaError_t launchRenderKernel(uchar4* out, const RenderParams& p,
-                                          cudaStream_t stream);
+extern "C" cudaError_t launchRenderPipeline(uchar4* out, float4* accum,
+                                            float4* bloomA, float4* bloomB,
+                                            const RenderParams& p,
+                                            cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 int CudaInterop::findCudaDeviceByUUID(const uint8_t uuid[16])
@@ -41,11 +43,21 @@ int CudaInterop::findCudaDeviceByUUID(const uint8_t uuid[16])
 }
 
 // ---------------------------------------------------------------------------
-void CudaInterop::init(int cudaDevice,
+void CudaInterop::init(int cudaDevice, int width, int height,
                        HANDLE vkMemoryHandle, size_t allocSize, size_t bufferSize,
                        HANDLE semVkToCudaHandle, HANDLE semCudaToVkHandle)
 {
     CUDA_CHECK(cudaSetDevice(cudaDevice));
+
+    // Auxiliary buffers for the display-quality pipeline (device-local,
+    // CUDA-private; never copied to the CPU).
+    const int bw = (width + 1) / 2, bh = (height + 1) / 2;
+    CUDA_CHECK(cudaMalloc(&m_accum,  sizeof(float4) * (size_t)width * height));
+    CUDA_CHECK(cudaMalloc(&m_bloomA, sizeof(float4) * (size_t)bw * bh));
+    CUDA_CHECK(cudaMalloc(&m_bloomB, sizeof(float4) * (size_t)bw * bh));
+    CUDA_CHECK(cudaMemset(m_accum,  0, sizeof(float4) * (size_t)width * height));
+    CUDA_CHECK(cudaMemset(m_bloomA, 0, sizeof(float4) * (size_t)bw * bh));
+    CUDA_CHECK(cudaMemset(m_bloomB, 0, sizeof(float4) * (size_t)bw * bh));
     CUDA_CHECK(cudaStreamCreateWithFlags(&m_stream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreate(&m_evStart));
     CUDA_CHECK(cudaEventCreate(&m_evStop));
@@ -92,7 +104,8 @@ float CudaInterop::render(const RenderParams& params, bool waitForVulkan)
     }
 
     CUDA_CHECK(cudaEventRecord(m_evStart, m_stream));
-    CUDA_CHECK(launchRenderKernel((uchar4*)m_devPtr, params, m_stream));
+    CUDA_CHECK(launchRenderPipeline((uchar4*)m_devPtr, m_accum,
+                                    m_bloomA, m_bloomB, params, m_stream));
     CUDA_CHECK(cudaEventRecord(m_evStop, m_stream));
 
     cudaExternalSemaphoreSignalParams sp{};
@@ -112,6 +125,9 @@ void CudaInterop::cleanup()
 {
     sync();
     if (m_devPtr)      cudaFree(m_devPtr);
+    if (m_accum)       cudaFree(m_accum);
+    if (m_bloomA)      cudaFree(m_bloomA);
+    if (m_bloomB)      cudaFree(m_bloomB);
     if (m_extMemory)   cudaDestroyExternalMemory(m_extMemory);
     if (m_semVkToCuda) cudaDestroyExternalSemaphore(m_semVkToCuda);
     if (m_semCudaToVk) cudaDestroyExternalSemaphore(m_semCudaToVk);
@@ -119,6 +135,7 @@ void CudaInterop::cleanup()
     if (m_evStop)      cudaEventDestroy(m_evStop);
     if (m_stream)      cudaStreamDestroy(m_stream);
     m_devPtr = nullptr;
+    m_accum = m_bloomA = m_bloomB = nullptr;
     m_extMemory = nullptr;
     m_semVkToCuda = m_semCudaToVk = nullptr;
     m_stream = nullptr;

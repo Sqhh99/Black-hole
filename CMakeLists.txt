@@ -40,6 +40,9 @@ add_executable(blackhole
     src/vulkan_context.h
     src/cuda_interop.h
     src/render_params.h
+    src/metric.cuh
+    src/trace.cuh
+    src/kernel_launch.h
     src/vec_math.cuh
     src/logger.h
 )
@@ -69,6 +72,22 @@ set_target_properties(blackhole PROPERTIES
     CUDA_RUNTIME_LIBRARY Static
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 )
+
+# ---------------------------------------------------------------------------
+# Verification suite (CUDA console app; no Vulkan / GLFW dependency).
+# Shares the render kernel TU so it exercises exactly the shipped integrators
+# and the sanitizing launcher. Run via `build.cmd test`.
+# ---------------------------------------------------------------------------
+add_executable(blackhole_tests
+    tests/test_main.cu
+    src/black_hole_kernel.cu
+)
+target_include_directories(blackhole_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(blackhole_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(blackhole_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3 --use_fast_math>)
+target_link_libraries(blackhole_tests PRIVATE CUDA::cudart)
+set_target_properties(blackhole_tests PROPERTIES CUDA_RUNTIME_LIBRARY Static)
 
 message(STATUS "CUDA architectures : ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Vulkan include     : ${Vulkan_INCLUDE_DIRS}")
