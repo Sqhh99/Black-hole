@@ -62,7 +62,9 @@ __device__ inline float3 accumBlend(float3 prev, float3 cur,
         float n = (float)sampleIndex;
         return prev + (cur - prev) * (1.0f / (n + 1.0f));
     }
-    return lerp3(prev, cur, 0.25f);   // EMA while the disk animates
+    // Higher α keeps orbiting hot spots / photon-ring arcs readable while
+    // still damping single-sample noise. (Was 0.25; 0.42 ≈ 2-frame memory.)
+    return lerp3(prev, cur, 0.42f);
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +76,9 @@ __device__ inline float3 accumBlend(float3 prev, float3 cur,
 __device__ inline float3 bloomBrightPass(float3 c)
 {
     float l = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-    float w = smoothstepf(0.85f, 1.8f, l);
+    // Higher threshold: bloom only the photon-ring / beamed inner disk,
+    // not the whole outer annulus (avoids a soft yellow pancake glow).
+    float w = smoothstepf(1.15f, 2.4f, l);
     return c * w;
 }
 

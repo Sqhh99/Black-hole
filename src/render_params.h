@@ -9,6 +9,11 @@
 // makes the Schwarzschild radius rs = 2M = 1 code unit, preserving the
 // original renderer's length scale (camera distances, disk radii, escape
 // radius) and therefore its exact Schwarzschild visuals.
+//
+// Spin a = a* M may be negative (retrograde). Charge Q = q M stays >= 0.
+// When allowNaked != 0, a*^2 + q^2 may exceed 1 (experimental naked
+// singularity mode); otherwise parameters are clamped inside the extremal
+// bound a*^2 + q^2 <= 0.995.
 // ---------------------------------------------------------------------------
 #include <vector_types.h>
 #include <cstdint>
@@ -32,11 +37,12 @@ struct RenderParams
     // validates them via bhValidateAndDerive in metric.cuh)
     int      model   = 0;      // 0 Schwarzschild, 1 RN, 2 Kerr, 3 Kerr-Newman
     float    M       = 0.5f;   // mass (mass scale of the scene; rs = 2M)
-    float    aSpin   = 0.f;    // a  = a* M   (spin,   code units)
-    float    Qc      = 0.f;    // Q  = q  M   (charge, code units)
-    float    rPlus   = 1.0f;   // outer event horizon  r+ (precomputed, host)
-    float    rPhoton = 1.5f;   // photon sphere / prograde photon orbit
+    float    aSpin   = 0.f;    // a  = a* M   (spin, signed; code units)
+    float    Qc      = 0.f;    // Q  = q  M   (charge, code units, >= 0)
+    float    rPlus   = 1.0f;   // outer event horizon r+ (0 if naked)
+    float    rPhoton = 1.5f;   // photon sphere / co-rotating photon orbit
     float    rErgo   = 1.0f;   // equatorial ergosphere radius (info)
+    int      allowNaked = 0;   // 1 = permit a*^2+q^2 > 1 (experimental)
 
     // Integration
     //   Spherical models: dPhi is the RK4 step in orbital angle phi.
@@ -51,8 +57,18 @@ struct RenderParams
     // Accretion disk (inner edge = ISCO of the current model, host-computed)
     int      diskEnabled = 1;
     float    diskInner   = 3.0f;  // ISCO: 6M for Schwarzschild with M = 0.5
-    float    diskOuter   = 12.0f; // 24M
+    float    diskOuter   = 8.0f;  // ~16M — mid size (24M too large, 12M a bit tight)
     float    diskTime    = 0.f;   // animation time (seconds, pausable)
+
+    // Phenomenological RT scales (emission / absorption along the disk).
+    // Intensity uses I_obs ∝ g^3 I_emit (monochromatic convention).
+    float    diskEmisScale = 4.5f;   // multiplies blackbody * dens * ds * g^3
+    float    diskAbsScale  = 2.2f;   // optical-depth scale (keeps shadow crisp)
+
+    // Orbiting hot spots near the ISCO (EHT-style flares). Lensed into the
+    // photon ring by the geodesic integrator — not a screen-space overlay.
+    int      hotSpotsEnabled  = 1;   // 0 = off
+    float    hotSpotStrength  = 0.65f; // moderate — accent ring, not wash disk
 
     // Post processing
     float    exposure = 1.0f;

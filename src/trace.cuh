@@ -40,19 +40,55 @@
 //    derivatives.
 //
 // The accretion disk is sampled volumetrically along the geodesic in both
-// paths. For the rotating models the combined gravitational + Doppler shift
-// uses the exact relativistic factor  g = 1 / [ u^t (E - Omega Lz) ]  of a
-// circular equatorial emitter, which encodes frame dragging, so redshift
-// asymmetry responds to both spin and charge.
+// paths. All models share the exact relativistic factor
+//   g = 1 / [ u^t (E - Omega Lz) ]
+// of a circular equatorial Keplerian emitter (Schwarzschild / RN with a=0,
+// Kerr / KN with spin). Photon (E, Lz) come from a static-observer tetrad
+// at the camera. Intensity uses I_nu ∝ g^3 with T_obs = g T_emit.
+//
+// Slow light: coordinate flight time is accumulated along the backward ray
+// so turbulent advection uses t_emit = diskTime - t_flight (emission earlier
+// than observation for long-wound photon-ring paths).
+//
+// Background starfield is scaled by the static-observer camera energy factor
+// (infinity -> camera blueshift, bolometric ~ g^4 for the sky).
 // ---------------------------------------------------------------------------
 #include "render_params.h"
 #include "metric.cuh"
 #include "vec_math.cuh"
 #include <cuda_runtime.h>
 
-// Disk temperature at the inner edge [K-ish]
-constexpr float BH_T_INNER = 9500.f;
-constexpr float BH_PI      = 3.14159265358979f;
+// Disk temperature scale [K-ish] for blackbodyRGB — tuned for orange/red
+// EHT–Gargantua palette after g-factor shift (avoid green midtones).
+constexpr float BH_T_INNER  = 11500.f;
+constexpr float BH_T_CORONA = 16000.f;
+constexpr float BH_PI       = 3.14159265358979f;
+
+// Capture surface radius: event horizon when present, else singularity cut.
+__device__ inline float bhCaptureRadius(const RenderParams& P)
+{
+    if (P.rPlus > 1e-6f) return P.rPlus;
+    return BH_SING_CUT_OVER_M * P.M;
+}
+
+// Static-observer camera energy factor g = E_cam / E_infty (>= 1: blueshift
+// of the sky as light falls in). Uses alpha = sqrt(-g_tt) so g = 1/alpha.
+__device__ inline float cameraEnergyFactor(const RenderParams& P)
+{
+    float r = length(P.camPos);
+    if (r < 1e-4f) return 1.f;
+    if (P.model == BH_KERR || P.model == BH_KERR_NEWMAN)
+    {
+        float cth = clampf(P.camPos.y / r, -1.f, 1.f);
+        float Sig = bhSigma(r, cth, P.aSpin);
+        float m2r = 2.f * P.M * r - P.Qc * P.Qc;
+        float gtt = -(1.f - m2r / fmaxf(Sig, 1e-8f));
+        float alpha = sqrtf(fmaxf(-gtt, 1e-6f));
+        return clampf(1.f / alpha, 0.5f, 4.f);
+    }
+    float f = bhSphF(r, P.M, P.Qc);
+    return clampf(1.f / sqrtf(fmaxf(f, 1e-6f)), 0.5f, 4.f);
+}
 
 // ---------------------------------------------------------------------------
 // Blackbody color (Tanner Helland style fit), returned in linear RGB.
@@ -104,136 +140,243 @@ __device__ inline float3 starLayer(float3 d, float cellScale, float intensity)
     return col * (bright * core * intensity);
 }
 
-__device__ inline float3 backgroundColor(float3 dir)
+// gCam = E_cam / E_infty (static-observer blueshift of the sky).
+__device__ inline float3 backgroundColor(float3 dir, float gCam = 1.f)
 {
     float3 d = normalize(dir);
     float3 c = make_float3(0.f, 0.f, 0.f);
+
+    float Tscale = clampf(gCam, 0.5f, 3.f);
+    float Iscale = Tscale * Tscale * Tscale * Tscale;
 
     c += starLayer(d, 90.f,  1.0f);
     c += starLayer(d, 210.f, 0.45f);
     c += starLayer(d, 460.f, 0.18f);
 
+    float3 hot  = blackbodyRGB(6500.f * Tscale);
+    float3 tint = hot / fmaxf((hot.x + hot.y + hot.z) / 3.f, 1e-4f);
+    // Component-wise mix: 0.55 * white + 0.45 * tint (no float+float3 op).
+    c = c * (make_float3(0.55f, 0.55f, 0.55f) + tint * 0.45f) * Iscale;
+
     float az   = atan2f(d.z, d.x);
     float neb  = fbm(make_float2(az * 2.2f, d.y * 5.0f));
     float band = expf(-d.y * d.y * 14.f);
-    c += make_float3(0.020f, 0.024f, 0.045f) * (neb * band);
-    c += make_float3(0.004f, 0.005f, 0.009f);
+    c += make_float3(0.020f, 0.024f, 0.045f) * (neb * band) * Iscale;
+    c += make_float3(0.004f, 0.005f, 0.009f) * Iscale;
 
     return c;
 }
 
 // ---------------------------------------------------------------------------
-// Accretion disk sampling context.
-//   gr = 0 : spherically symmetric shading (original special-relativistic
-//            Doppler x gravitational redshift; identical to the baseline
-//            for Schwarzschild).
-//   gr = 1 : rotating models; exact g-factor from the photon's conserved
-//            (E, Lz) and a circular equatorial emitter in Kerr-Newman.
+// Accretion disk sampling context — unified GR emitter formula for all models.
+// Photon conserved (E, Lz) from the static-observer tetrad at the camera;
+// g = 1/[u^t (E − Ω Lz)] for a co-rotating equatorial Keplerian emitter
+// (Schwarzschild / RN / Kerr / KN via bhEmitterGFactor).
 // ---------------------------------------------------------------------------
 struct DiskCtx
 {
-    int   gr;
-    float E;    // photon conserved energy (camera-frame energy = 1)
-    float Lz;   // photon conserved angular momentum
+    float E;    // photon conserved energy (−p_t)
+    float Lz;   // photon conserved angular momentum (p_φ)
+    float a;    // spin parameter (code units) used for Ω and metric
+    float Q;    // charge (code units)
 };
+
+// Static-observer tetrad → photon conserved E, Lz (same construction as the
+// Kerr integrator; valid for a = 0 Schwarzschild / RN as well).
+__device__ inline void photonConservedEL(float3 origin, float3 dir,
+                                         float M, float a, float Q,
+                                         float& E, float& Lz)
+{
+    float r0 = length(origin);
+    if (r0 < 1e-4f) { E = 1.f; Lz = 0.f; return; }
+    float cth0 = clampf(origin.y / r0, -1.f, 1.f);
+    float th0  = acosf(cth0);
+    float ph0  = atan2f(-origin.z, origin.x);
+
+    float s  = sinf(th0), c = cosf(th0);
+    float sp = sinf(ph0), cp = cosf(ph0);
+    // Orthonormal polar basis (matches kerrBasis / kerrToCart)
+    float3 er  = make_float3(s * cp,  c, -s * sp);
+    float3 eph = make_float3(-sp, 0.f, -cp);
+    float dpc = dot(dir, eph);
+
+    float s0 = s; if (s0 < 1e-4f) s0 = 1e-4f;
+    float s02 = s0 * s0;
+    float Sig0 = bhSigma(r0, cth0, a);
+    float m2r0 = 2.f * M * r0 - Q * Q;
+
+    float gtt = -(1.f - m2r0 / fmaxf(Sig0, 1e-8f));
+    if (gtt > -1e-5f) gtt = -1e-5f;
+    float gtp = -a * m2r0 * s02 / Sig0;
+    float gpp = (r0 * r0 + a * a + m2r0 * a * a * s02 / Sig0) * s02;
+
+    float A    = rsqrtf(fmaxf(gpp - gtp * gtp / gtt, 1e-8f));
+    float ptUp = rsqrtf(-gtt) - dpc * A * gtp / gtt;
+    float pfUp = dpc * A;
+
+    E  = -(gtt * ptUp + gtp * pfUp);
+    Lz =   gtp * ptUp + gpp * pfUp;
+    if (!(E > 1e-6f) || !isfinite(E)) { E = 1.f; Lz = 0.f; }
+}
+
+// Wrap angle difference into (−π, π].
+__device__ inline float wrapDeltaPhi(float d)
+{
+    d = fmodf(d + BH_PI, 2.f * BH_PI);
+    if (d < 0.f) d += 2.f * BH_PI;
+    return d - BH_PI;
+}
 
 // ---------------------------------------------------------------------------
 // Volumetric disk sampling along one geodesic segment [a, b] (Cartesian).
 // `rayDir` points away from the camera along the backward ray.
+// `tEmit` is the emission coordinate time (slow-light: diskTime - t_flight).
+//
+// Thin-disk radiative model (Gargantua / EHT–inspired, real-time GR):
+//   • Keplerian orbital velocity field Ω(r) from the metric
+//   • Exact g = 1/[u^t (E − Ω Lz)]  (grav. redshift + Doppler beaming)
+//   • Novikov–Thorne flux → T(r) ∝ F^{1/4}, blackbody colour
+//   • I_obs ∝ g^3 B_ν(T_obs) with T_obs = g T_emit  (I_ν invariant)
+//   • Volumetric GR path integral along null geodesics (caller)
 // ---------------------------------------------------------------------------
 __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& ctx,
-                                         float3 a, float3 b, float3 rayDir,
+                                         float3 a, float3 b, float3 /*rayDir*/,
+                                         float tEmit,
                                          float3& accum, float& trans)
 {
     float3 seg    = b - a;
     float  segLen = length(seg);
     if (segLen < 1e-7f) return;
 
-    float maxH = 0.20f * sqrtf(P.diskOuter) * 3.0f;
+    // Thin disk: tight vertical cull (H/R ~ few percent)
+    float maxH = 0.10f * sqrtf(P.diskOuter) * 3.0f;
     if (a.y > maxH && b.y > maxH) return;
     if (a.y < -maxH && b.y < -maxH) return;
 
-    // Radial culling: a segment cannot reach the disk annulus if both
-    // endpoints are further than segLen outside it (cylindrical metric).
     float rcA = sqrtf(a.x * a.x + a.z * a.z);
     float rcB = sqrtf(b.x * b.x + b.z * b.z);
     float rcMin = fminf(rcA, rcB), rcMax = fmaxf(rcA, rcB);
     if (rcMin - segLen > P.diskOuter) return;
     if (rcMax + segLen < P.diskInner) return;
 
-    int nSub = 1 + (int)(segLen / 0.15f);
-    if (nSub > 12) nSub = 12;
+    int nSub = 1 + (int)(segLen / 0.12f);
+    if (nSub > 14) nSub = 14;
     float ds = segLen / (float)nSub;
+
+    const float emisK = P.diskEmisScale;
+    const float absK  = P.diskAbsScale;
+    const float rin   = fmaxf(P.diskInner, 1e-4f);
+    const float M = P.M, aSpin = ctx.a, Qc = ctx.Q;
 
     for (int j = 0; j < nSub; ++j)
     {
         float  t  = ((float)j + 0.5f) / (float)nSub;
         float3 p  = lerp3(a, b, t);
-        float  rc = sqrtf(p.x * p.x + p.z * p.z);      // cylindrical radius
-        if (rc < P.diskInner || rc > P.diskOuter) continue;
+        float  rc = sqrtf(p.x * p.x + p.z * p.z);
+        if (rc < rin || rc > P.diskOuter) continue;
 
-        float H  = 0.20f * sqrtf(rc);
-        float dz = p.y / H;
+        // Thin Gaussian vertical structure, H/R ≈ 0.05–0.08
+        float HR = 0.055f + 0.02f * (rc / fmaxf(P.diskOuter, rin));
+        float H  = HR * rc;
+        float dz = p.y / fmaxf(H, 1e-4f);
         if (fabsf(dz) > 3.0f) continue;
         float dens = expf(-dz * dz);
 
-        dens *= smoothstepf(P.diskInner, P.diskInner * 1.18f, rc);
-        dens *= 1.0f - smoothstepf(P.diskOuter * 0.72f, P.diskOuter, rc);
+        // Soft ISCO wall; hard outer die-off
+        dens *= smoothstepf(rin, rin * 1.12f, rc);
+        dens *= 1.0f - smoothstepf(P.diskOuter * 0.55f, P.diskOuter, rc);
+        dens *= 1.f - 0.65f * smoothstepf(0.25f, 0.85f,
+                         fabsf(p.y) / fmaxf(rc, 0.15f));
 
-        // --- Relativistic g-factor + turbulence phase -------------------
-        float g;
-        float omega; // coordinate angular velocity, drives streak advection
-        if (ctx.gr)
+        // --- Orbital velocity + full GR g-factor (all models) -----------
+        float omega = bhOmegaCircular(rc, M, aSpin, Qc);
+        if (omega <= 0.f) continue;
+        float g = bhEmitterGFactor(rc, M, aSpin, Qc, ctx.E, ctx.Lz);
+        if (g <= 0.f) continue;
+
+        // --- Turbulence + spiral arms (filamentary plasma) -------------
+        // Azimuth matches kerrToCart (spin +Y): φ = atan2(-z, x)
+        float azim = atan2f(-p.z, p.x);
+        float azr  = azim - omega * tEmit;
+        float n0   = fbm(make_float2(rc * 4.2f, azr * 2.1f + rc * 0.9f));
+        float n1   = fbm(make_float2(rc * 9.5f, azr * 4.0f - rc * 1.4f + 19.f));
+        float n2   = fbm(make_float2(rc * 18.f, azr * 7.5f + 5.3f));
+        dens *= (0.18f + 1.15f * n0 + 0.55f * n1 + 0.28f * n2);
+        dens *= dens;
+
+        float psi1 = azim - 0.55f * omega * tEmit - 1.6f * logf(fmaxf(rc, 0.2f));
+        float psi2 = 2.f * azim - 0.38f * omega * tEmit - 1.0f * logf(fmaxf(rc, 0.2f));
+        dens *= (1.f + 0.42f * cosf(psi1) + 0.22f * cosf(psi2));
+
+        // --- ISCO hot spots (photon-ring dynamics) ---------------------
+        float spotBoost = 0.f;
+        float spotHeat  = 0.f;
+        if (P.hotSpotsEnabled && P.hotSpotStrength > 1e-4f)
         {
-            omega = bhOmegaCircular(rc, P.M, P.aSpin, P.Qc);
-            if (omega <= 0.f) continue;
-            float gtt, gtp, gpp;
-            bhEquatorialMetric(rc, P.M, P.aSpin, P.Qc, gtt, gtp, gpp);
-            float den = -(gtt + 2.f * omega * gtp + omega * omega * gpp);
-            if (den < 1e-4f) continue;               // orbit not timelike
-            float ut  = rsqrtf(den);
-            float Eem = ut * (ctx.E - omega * ctx.Lz);
-            if (Eem < 0.05f) Eem = 0.05f;
-            g = clampf(1.0f / Eem, 0.05f, 4.0f);
+            const float rHs0 = rin * 1.06f;
+            const float rHs1 = rin * 1.18f;
+            float om0 = bhOmegaCircular(rHs0, M, aSpin, Qc);
+            float om1 = bhOmegaCircular(rHs1, M, aSpin, Qc);
+            if (om0 <= 0.f) om0 = omega;
+            if (om1 <= 0.f) om1 = omega;
+
+            const float inv2sPhi = 1.f / (2.f * 0.18f * 0.18f);
+            const float inv2sR0  = 1.f / (2.f * (0.09f * rHs0) * (0.09f * rHs0));
+            const float inv2sR1  = 1.f / (2.f * (0.11f * rHs1) * (0.11f * rHs1));
+
+            float dph0 = wrapDeltaPhi(azim - (om0 * tEmit + 0.4f));
+            float dph1 = wrapDeltaPhi(azim - (om1 * tEmit + 0.4f + BH_PI));
+            float dr0  = rc - rHs0;
+            float dr1  = rc - rHs1;
+            float flick0 = 0.72f + 0.28f * sinf(1.7f * tEmit + 0.9f);
+            float flick1 = 0.65f + 0.35f * sinf(1.1f * tEmit + 2.3f);
+            float g0 = expf(-(dph0 * dph0) * inv2sPhi - dr0 * dr0 * inv2sR0
+                            - dz * dz * 0.45f);
+            float g1 = expf(-(dph1 * dph1) * inv2sPhi - dr1 * dr1 * inv2sR1
+                            - dz * dz * 0.45f);
+            float S = P.hotSpotStrength;
+            spotBoost = S * (5.0f * flick0 * g0 + 3.2f * flick1 * g1);
+            spotHeat  = S * (0.70f * flick0 * g0 + 0.45f * flick1 * g1);
+            dens += dens * 0.25f * (g0 + g1) * S;
         }
-        else
+        if (dens < 1e-5f && spotBoost < 1e-4f) continue;
+
+        float coronaW = expf(-(fabsf(dz) - 1.6f) * (fabsf(dz) - 1.6f) * 3.0f);
+        float corona  = 0.08f * coronaW;
+
+        // --- NT flux → temperature → blackbody with g^3 ---------------
+        float Fr = bhThinDiskFluxWeight(rc, rin);
+        if (Fr < 1e-8f && spotBoost < 1e-4f) continue;
+
+        // Rest-frame effective temperature T_eff ∝ F^{1/4}
+        float Temit = BH_T_INNER * powf(fmaxf(Fr, 1e-6f), 0.25f);
+        Temit = clampf(Temit, 1800.f, 22000.f);
+        Temit *= (1.f + 1.6f * spotHeat);
+
+        // Frequency shift: ν_obs = g ν_emit ⇒ T_obs = g T_emit for Planckian
+        float Tobs = clampf(Temit * g, 1200.f, 40000.f);
+        float3 col = blackbodyRGB(Tobs);
+        // Specific intensity: I_ν / ν^3 invariant ⇒ I_obs ∝ g^3 I_emit
+        float g3   = g * g * g;
+        float emis = Fr * g3 * (1.f + spotBoost);
+
+        float3 colC  = blackbodyRGB(clampf(BH_T_CORONA * g * (1.f + 0.4f * spotHeat),
+                                           1200.f, 40000.f));
+        float  emisC = 0.22f * emis * g;
+
+        float w  = dens * ds;
+        float wC = corona * dens * ds;
+        float3 add = col * (emis * emisK * w) + colC * (emisC * emisK * wC);
+        if (spotBoost > 1e-4f)
         {
-            // Original baseline shading (exact for Q = 0), generalized to
-            // f(r) = 1 - 2M/r + Q^2/r^2 for Reissner-Nordstrom.
-            float rr   = length(p);
-            float w2   = P.M / rc - (P.Qc * P.Qc) / (rc * rc);
-            float beta = sqrtf(fmaxf(w2, 0.f))
-                       * rsqrtf(fmaxf(bhSphF(rc, P.M, P.Qc), 0.05f));
-            beta = fminf(beta, 0.95f);
-            float gamma = rsqrtf(1.0f - beta * beta);
-
-            float3 vhat = normalize(make_float3(p.z, 0.f, -p.x));
-            float3 nph  = -rayDir;
-
-            float dopp  = 1.0f / (gamma * (1.0f - beta * dot(vhat, nph)));
-            float ggrav = sqrtf(fmaxf(bhSphF(rr, P.M, P.Qc), 0.02f));
-            g = dopp * ggrav;
-            omega = sqrtf(fmaxf(P.M / (rc * rc * rc)
-                              - (P.Qc * P.Qc) / (rc * rc * rc * rc), 0.f));
+            float wS = (0.12f + dens) * ds;
+            add += col * (spotBoost * g3 * emisK * 0.45f * wS);
         }
+        accum += add * trans;
 
-        // Differentially rotating turbulence (azimuthal streaks). The two
-        // paths use their own internally consistent azimuth convention.
-        float azim = ctx.gr ? atan2f(-p.z, p.x) : atan2f(p.z, p.x);
-        float azr  = azim - omega * P.diskTime;
-        float n    = fbm(make_float2(rc * 3.1f, azr * 1.6f + rc * 0.7f));
-        dens      *= (0.45f + 1.1f * n);
-        if (dens < 1e-4f) continue;
-
-        // --- Emission ----------------------------------------------------
-        float Temit = BH_T_INNER * powf(P.diskInner / rc, 0.75f);
-        float Tobs  = Temit * g;
-        float3 col  = blackbodyRGB(Tobs);
-        float emis  = powf(P.diskInner / rc, 3.0f) * (g * g) * (g * g);
-
-        float w = dens * ds;
-        accum += col * (emis * 7.0f * w) * trans;
-        trans *= expf(-1.6f * w);
+        // Transfer: dI = j ds − α I ds  (emission + absorption along ray)
+        float tau = absK * (w + 0.45f * wC) * (1.f + 0.35f * dens) * 1.05f;
+        trans *= expf(-tau);
         if (trans < 0.01f) return;
     }
 }
@@ -274,25 +417,23 @@ __device__ inline float3 cameraRayDir(const RenderParams& P, float fx, float fy)
 }
 
 // ---------------------------------------------------------------------------
-// Straight-line fallback for (nearly) exactly radial rays in the spherical
-// path, where the orbital-plane basis is degenerate.
+// Fallback for exactly radial rays (orbital-plane basis is degenerate).
+// True radial inbound null geodesics fall into the horizon — no Euclidean
+// disk sampling (that would invent a midplane column). This only covers
+// a measure-zero set of directions; the shadow itself comes from the Binet
+// integrator via u >= 1/r+ (or r <= r+), never from a drawn sphere.
 // ---------------------------------------------------------------------------
 __device__ inline float3 radialRay(const RenderParams& P, const DiskCtx& ctx,
                                    float3 o, float3 d,
                                    float3& accum, float& trans, bool& horizon)
 {
-    float escR = 120.f * P.M;
-    float step = 0.15f;
-    float3 p = o;
-    for (int i = 0; i < 800; ++i)
+    (void)ctx; (void)accum; (void)trans; (void)P;
+    if (dot(d, o) < 0.f)
     {
-        float3 q = p + d * step;
-        if (P.diskEnabled) sampleDiskSegment(P, ctx, p, q, d, accum, trans);
-        p = q;
-        float r = length(p);
-        if (r < P.rPlus) { horizon = true; return d; }
-        if (r > escR)     return d;
+        horizon = true;
+        return d;
     }
+    // Outbound radial: escapes to infinity without disk samples.
     return d;
 }
 
@@ -312,12 +453,18 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
     R.maxHviol = 0.f;
     R.steps = 0;
 
-    const DiskCtx ctx = {0, 0.f, 0.f};
     const float M  = P.M;
     const float Q2 = P.Qc * P.Qc;
-    const float uHor    = 1.0f / P.rPlus;
+    const float rCap    = bhCaptureRadius(P);
+    const float uHor    = 1.0f / fmaxf(rCap, 1e-6f);
     const float escR    = 120.f * M;
     const float uEscape = 1.0f / escR;
+
+    // Conserved E, Lz from static-observer tetrad (a=0); enables exact
+    // Keplerian g-factor for Schwarzschild / RN disk emission.
+    float Ephot = 1.f, Lzphot = 0.f;
+    photonConservedEL(origin, dir, M, 0.f, P.Qc, Ephot, Lzphot);
+    const DiskCtx ctx = {Ephot, Lzphot, 0.f, P.Qc};
 
     float3 c  = origin;
     float  r0 = length(c);
@@ -326,7 +473,10 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
     float3 perp = dir - e1 * ddr;
     float  pl   = length(perp);
 
-    if (pl < 1e-4f)
+    // Only exactly-degenerate orbital plane (pl ~ 0). Do NOT invent a smaller
+    // capture cone (e.g. b < ε): that painted a pure-black "mini sphere" in
+    // the middle of the real shadow while neighbours still integrated.
+    if (pl < 1e-6f)
     {
         R.escDir  = radialRay(P, ctx, c, dir, R.accum, R.trans, R.horizon);
         R.escaped = !R.horizon;
@@ -343,13 +493,24 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
     // (Same physical convention as the tetrad used by the Kerr integrator;
     // Euclidean directions are never used as coordinate derivatives.)
     float f0  = fmaxf(bhSphF(r0, M, P.Qc), 1e-6f);
+    // Impact parameter b = L/E ≈ r0 * pl / sqrt(f0) for the static observer map.
+    float bImpact = fmaxf(r0 * pl / sqrtf(f0), 1e-6f);
+
     float u   = 1.0f / r0;
     float du  = -sqrtf(f0) * ddr / (r0 * pl);
     float phi = 0.f;
+    float tFlight = 0.f;
 
     float3 prevPos = c;
     float3 dir3    = dir;
-    float  h       = P.dPhi;
+    // Adaptive angular step: near-radial rays need smaller dφ so RK4 stays
+    // stable without clamping u' (which would corrupt capture vs escape).
+    float h = P.dPhi;
+    {
+        float hNeed = 0.08f / fmaxf(fabsf(du), 1.f);
+        if (h > hNeed) h = hNeed;
+        if (h < P.dPhi * 0.05f) h = P.dPhi * 0.05f;
+    }
 
     // RHS of the generalized Binet equation
     auto acc = [M, Q2](float uu)
@@ -382,6 +543,8 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
         du  += (h / 6.f) * (k1v + 2.f * k2v + 2.f * k3v + k4v);
         phi += h;
 
+        // Capture ONLY by horizon crossing or non-finite state — never by a
+        // hand-drawn radius or a reduced impact-parameter ball.
         if (!isfinite(u) || !isfinite(du)) { R.horizon = true; break; }
         if (u >= uHor)                     { R.horizon = true; break; }
 
@@ -393,18 +556,37 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
         float3 pos = m * r;
         dir3 = normalize(m * drdphi + mp * r);
 
+        // Slow light: dt/dφ = r² / (b f(r)) for the spherical null geodesic.
+        float fR = fmaxf(bhSphF(r, M, P.Qc), 1e-4f);
+        tFlight += h * (r * r) / (bImpact * fR);
+
         if (P.diskEnabled && R.trans > 0.01f)
-            sampleDiskSegment(P, ctx, prevPos, pos, dir3, R.accum, R.trans);
+            sampleDiskSegment(P, ctx, prevPos, pos, dir3,
+                              P.diskTime - tFlight, R.accum, R.trans);
         prevPos = pos;
 
+        // Escape: past large radius with outward motion
         if (u < uEscape && du < 0.f) { R.escaped = true; R.escDir = dir3; break; }
+
+        // Keep |Δu| per step bounded by refining h (no artificial capture).
+        float duAbs = fabsf(du);
+        if (duAbs * h > 0.15f)
+        {
+            h = 0.12f / fmaxf(duAbs, 1.f);
+            if (h < P.dPhi * 0.03f) h = P.dPhi * 0.03f;
+        }
+        else if (h < P.dPhi && duAbs * h < 0.02f)
+        {
+            h = fminf(P.dPhi, h * 1.25f);
+        }
     }
     R.steps = step;
 
     if (!R.horizon && !R.escaped)
     {
         // Step budget exhausted: deep strong-field rays count as captured
-        if (u > 1.0f / (6.f * M)) R.horizon = true;
+        // only if they are clearly inside the photon region (not a mini-sphere).
+        if (u > 1.0f / fmaxf(1.5f * P.rPhoton, 3.f * M)) R.horizon = true;
         else { R.escaped = true; R.escDir = dir3; }
     }
     return R;
@@ -495,6 +677,9 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
 
     const float M = P.M, a = P.aSpin, Q = P.Qc;
     const float rp   = P.rPlus;
+    const float rCap = bhCaptureRadius(P);
+    // Floor used by the adaptive step when there is no horizon.
+    const float rFloor = fmaxf(rp, rCap);
     const float escR = 120.f * M;
 
     // ---- Boyer-Lindquist coordinates of the camera -----------------------
@@ -535,9 +720,10 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
     y.pr  = drc * sqrtf(Sig0 / fmaxf(Del0, 1e-6f)); // p_r  = (Sig/Del) p^r
     y.pth = dtc * sqrtf(Sig0);                      // p_th = Sig p^theta
 
-    const DiskCtx ctx = {1, E, Lz};
+    const DiskCtx ctx = {E, Lz, a, Q};
     const float E2 = E * E;
     const bool  trackPos = (P.diskEnabled != 0);
+    float tFlight = 0.f;
 
     float3 prevPos = origin;
     float3 dir3    = dir;
@@ -554,13 +740,13 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
             !isfinite(d1.r) || !isfinite(d1.pr))
         { R.horizon = true; break; }
 
-        if (y.r <= rp * 1.002f + 1e-3f) { R.horizon = true; break; }
+        if (y.r <= rCap * 1.002f + 1e-3f) { R.horizon = true; break; }
 
         // Constraint monitor. Skipped in the immediate vicinity of the
         // horizon, where Delta -> 0 makes P^2/Delta a catastrophic float
         // cancellation: those rays are captured within a step or two and
         // the spike is a property of the diagnostic, not of the orbit.
-        if (wantStats && y.r > rp * 1.05f)
+        if (wantStats && y.r > rFloor * 1.05f)
         {
             float viol = fabsf(Kv) / (E2 * (y.r * y.r + a * a) + 1e-12f);
             if (viol > R.maxHviol) R.maxHviol = viol;
@@ -586,7 +772,7 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
         // inside the radial band the accretion disk occupies; in the weak
         // field it grows linearly with r, so far-field flight costs only
         // a handful of steps instead of dozens.
-        float h = 1.0f / (fabsf(d1.r) / (8.0f * P.dPhi * fmaxf(y.r - rp, 0.02f))
+        float h = 1.0f / (fabsf(d1.r) / (8.0f * P.dPhi * fmaxf(y.r - rFloor, 0.02f))
                         + (fabsf(d1.th) + fabsf(d1.ph)) / (2.2f * P.dPhi)
                         + 1e-5f);
         if (y.r < 1.5f * P.rPhoton) h *= 0.55f;
@@ -633,6 +819,19 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
         dLast = d4;
         haveDeriv = true;
 
+        // Slow light: Σ dt/dλ = a(L − a E sin²θ) + (r²+a²) P / Δ
+        {
+            float s, cth;
+            bhSinCos(y.th, s, cth);
+            if (s < 1e-4f) s = 1e-4f;
+            float Sig = bhSigma(y.r, cth, a);
+            float Del = fmaxf(bhDelta(y.r, M, a, Q), 1e-5f);
+            float Pp  = E * (y.r * y.r + a * a) - a * Lz;
+            float dtdl = (a * (Lz - a * E * s * s) + (y.r * y.r + a * a) * Pp / Del)
+                       / fmaxf(Sig, 1e-8f);
+            tFlight += h * fabsf(dtdl);
+        }
+
         // ---- Disk sampling along the Cartesian chord --------------------
         // (skipped entirely when the disk is off: no per-step Cartesian
         // conversion is needed then; escape directions are reconstructed
@@ -644,7 +843,8 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
             float  sl = length(stepv);
             if (sl > 1e-6f) dir3 = stepv * (1.f / sl);
             if (R.trans > 0.01f)
-                sampleDiskSegment(P, ctx, prevPos, pos, dir3, R.accum, R.trans);
+                sampleDiskSegment(P, ctx, prevPos, pos, dir3,
+                                  P.diskTime - tFlight, R.accum, R.trans);
             prevPos = pos;
         }
     }
@@ -696,8 +896,9 @@ __device__ inline float3 renderSampleHDR(const RenderParams& P,
 
     TraceResult t = traceRay(P, P.camPos, dir, false);
 
+    float  gCam = cameraEnergyFactor(P);
     float3 bg  = t.horizon ? make_float3(0.f, 0.f, 0.f)
-                           : backgroundColor(t.escDir);
+                           : backgroundColor(t.escDir, gCam);
     float3 hdr = t.accum + bg * t.trans;
 
     // Never let a stray non-finite sample poison the accumulation buffer.

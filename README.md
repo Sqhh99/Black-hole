@@ -12,9 +12,10 @@ for **Windows x64**, switchable live:
 
 Geometric units G = c = 1, unified mass parameter M (rs = 2M; the default
 mass scale M = 0.5 makes rs = 1 code unit, preserving the original scene
-scale), dimensionless spin a* = a/M and charge q = Q/M. Naked-singularity
-parameters (q² > 1, a*² > 1, a*² + q² > 1) are rejected and clamped inside
-the extremal bound with a console warning — never NaN, flicker, or a crash.
+scale), **signed** dimensionless spin a* = a/M (negative = retrograde) and
+charge q = Q/M. By default naked-singularity parameters (a*² + q² > 1) are
+clamped inside the extremal bound with a console warning; press `N` to unlock
+an experimental naked mode. Invalid inputs never produce NaN, flicker, or a crash.
 
 Per-pixel **null geodesics are numerically integrated (RK4)** on the GPU
 with **CUDA**; the HDR image is tone-mapped in the kernel and handed to
@@ -70,11 +71,15 @@ for SM 61/75/86/89).
 | Left mouse drag | Orbit camera (azimuth / elevation) |
 | Mouse wheel, `W`/`S` | Camera distance (clamped to stay outside 2.2 rs) |
 | `A`/`D`, `Q`/`E` | Azimuth / elevation via keyboard |
+| `X` / `Y` / `Z` | Rotate black hole about world **X / Y / Z** (hold; **Shift** reverses) |
+| `R` | **Reset** orientation + camera to defaults |
 | `-` / `=` | Exposure down / up |
 | `1` / `2` / `3` | Quality preset: fast / balanced (default) / high |
 | `F2` `F3` `F4` `F5` | Model: Schwarzschild / Reissner–Nordström / Kerr / Kerr–Newman |
-| `[` / `]` | Spin a* down / up (Kerr, Kerr–Newman; hold to repeat) |
+| `[` / `]` | Spin a* down / up (Kerr, Kerr–Newman; **signed**, a* < 0 = retrograde; hold to repeat) |
 | `,` / `.` | Charge q down / up (RN, Kerr–Newman; hold to repeat) |
+| `N` | Toggle **naked-singularity mode** (experimental; allows a*²+q² > 1) |
+| `H` | Toggle **orbiting hot spots** (ISCO flares → moving photon-ring arcs) |
 | `B` | Toggle HDR bloom |
 | `F1` | Toggle accretion disk |
 | `F11` | Toggle native fullscreen on the current monitor |
@@ -150,21 +155,22 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
   thin ring at the shadow edge **emerges from the integration itself**.
 - **Finite-thickness accretion disk** (inner edge = the **numerically
   computed ISCO of the current model** — 6M for Schwarzschild, sweeping in
-  toward the horizon with prograde spin — out to 24M; Gaussian vertical
-  profile with H ∝ √r) sampled volumetrically along the geodesic with
-  sub-stepping and self-absorption (transmittance), so the disk correctly
-  appears in front of, behind (lensed over/under), and inside the photon ring.
-- **Temperature profile** T ∝ r^(−3/4) (thin-disk scaling) mapped through a
-  black-body colour fit; inner edge hotter/brighter, outer edge cooler/darker.
-- **Relativistic Doppler beaming + gravitational redshift:** in the
-  spherical models, the circular-orbit velocity (with its Q-correction)
-  gives the special-relativistic Doppler factor combined with √f(r). In the
-  rotating models the shift is the **exact relativistic factor
-  g = 1 / [uᵗ (E − Ω L_z)]** of a circular equatorial emitter in
-  Kerr–Newman — frame dragging is inside Ω and the metric, so the redshift
-  distribution responds to both spin and charge. Observed intensity scales
-  as g⁴ and the black-body colour is shifted by g — the approaching side is
-  visibly brighter and bluer.
+  toward the horizon with prograde spin — out to **~16M** by default;
+  thin Gaussian vertical profile with H/R ≈ 0.05–0.08) sampled volumetrically
+  along the geodesic with sub-stepping and self-absorption (transmittance),
+  so the disk correctly appears in front of, behind (lensed over/under), and
+  inside the photon ring.
+- **Novikov–Thorne thin-disk flux** F(r) ∝ r⁻³ (1 − √(r_in/r)) with an
+  inner peak just outside the ISCO; rest-frame T_eff ∝ F^{1/4} mapped through
+  a black-body colour fit → hot orange inner edge, deep red outer filaments
+  (EHT / Gargantua palette).
+- **Unified GR emitter model (all four metrics):** photon conserved (E, L_z)
+  from a static-observer tetrad at the camera; circular Keplerian Ω(r) from
+  the metric; redshift factor
+  **g = 1 / [uᵗ (E − Ω L_z)]** (gravitational redshift + Doppler beaming +
+  frame dragging when a ≠ 0). Observed specific intensity uses
+  **I_ν,obs ∝ g³ I_ν,emit** with T_obs = g T_emit for the Planck spectrum —
+  approaching side brighter/hotter, receding side dimmer/redder.
 - **HDR display pipeline with progressive anti-aliasing:** every frame
   traces one jittered sub-pixel sample (R2 low-discrepancy sequence) into a
   linear-HDR float4 accumulation buffer. While the camera and model are
@@ -183,8 +189,19 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
   triangular-pdf spatial dither → 8-bit (R/B swap for BGRA swapchains). The
   dither removes 8-bit banding in the dark background and is static per
   pixel, so a converged image is perfectly still.
-- Turbulent disk detail via differentially-rotating fBm noise, animated in
-  real time (SPACE to pause).
+- Turbulent disk detail via high-contrast multi-scale differentially-rotating
+  fBm filaments, m=1/m=2 spiral arms, a soft corona layer, and **slow-light**
+  advection (emission time = observation time − geodesic flight time),
+  animated in real time (SPACE to pause).
+- **Starfield energy shift:** escaped rays sample the sky with the static
+  observer's camera g-factor (temperature and bolometric intensity), so the
+  background is no longer energy-blind.
+- **Orbiting hot spots** (`H`, on by default with the disk): one–two compact
+  flares just outside the ISCO co-rotate at Ω(r) with mild flicker. The same
+  geodesic integrator lenses them into the **photon ring** (including lagged
+  higher-order images via slow light) — ring motion is emergent, not a 2D
+  overlay. SPACE freezes the pattern; animation uses a slightly shorter TAA
+  window so the arcs stay readable.
 
 ## 6. Verification & testing status — please read
 
@@ -283,20 +300,19 @@ step-halving convergence) passes unchanged on the optimized code.
 
 ## 7. Known limitations
 
-- **Approximate radiative transfer:** simple emission/absorption with
-  heuristic scalings; no full frequency-dependent radiative transport, no
-  polarization, no photon redshift applied to the background starfield.
-- Naked singularities are not rendered: parameters are clamped to
-  a*² + q² ≤ 0.995. Spin is prograde-only (a* ≥ 0) in this version.
-- The Kerr–Newman "photon region" marker used for step refinement uses the
-  Kerr prograde formula (charge correction ignored); it only affects the
-  adaptive step heuristic, not correctness.
-- Disk turbulence is advected with the coordinate angular velocity Ω(r);
-  time-of-flight (slow-light) effects on the animation are ignored.
+- **Radiative transfer is still approximate:** emission/absorption with
+  parameterized scales, a soft corona layer, mild RGB opacity split, and
+  camera g-factor blueshift of the starfield. No full frequency-dependent
+  transfer equation and no polarization (ipole-class RT remains out of scope).
+- **Naked singularities** are opt-in (`N`): by default parameters stay inside
+  a*² + q² ≤ 0.995. In naked mode rays terminate on a small coordinate cut
+  (r ≈ 0.05 M) rather than a true curvature singularity treatment.
+- **Spin is signed** (a* ∈ [−0.995, 0.995] by default; co-rotating disk/ISCO).
+- Disk turbulence uses **slow-light** advection (t_emit = t_obs − Δt along the
+  backward geodesic) plus multi-scale fBm and m=1/m=2 spiral arms — still
+  **not a GRMHD simulation** (no live MHD, no precomputed dump loading yet).
 - Camera placement uses r = |x| spherical mapping rather than the oblate
   Boyer–Lindquist embedding (negligible at camera distances ≥ 2.2 units).
-- The disk is a phenomenological model (thin-disk temperature law + noise),
-  not a GRMHD simulation.
 - Windowed mode is fixed at 1280×720; `F11` switches to native fullscreen
   on the current monitor and renders at that fullscreen resolution, increasing
   GPU cost accordingly.

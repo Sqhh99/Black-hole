@@ -6,14 +6,15 @@
 // grid of camera rays and checks, with explicit tolerances:
 //
 //   T1  Event-horizon radii match the closed-form theory for all models.
-//   T2  Parameter validation rejects/clamps naked-singularity and
-//       non-finite inputs (q^2 > 1, a*^2 > 1, a*^2 + q^2 > 1, NaN, ...).
+//   T2  Parameter validation rejects/clamps naked-singularity (default)
+//       and non-finite inputs; retrograde a* is accepted; allowNaked path.
 //   T3  Model-consistency limits:
 //         RN(q=0)        == Schwarzschild   (same integrator, tight tol)
 //         KN(a*,q=0)     == Kerr(a*)        (same integrator, tight tol)
 //         Kerr(a*=0)     ~= Schwarzschild   (cross-integrator tol)
 //         KN(a*=0,q)     ~= RN(q)           (cross-integrator tol)
 //         KN(a*=0,q=0)   ~= Schwarzschild   (cross-integrator tol)
+//         Kerr(-a*) shadow asymmetry opposite Kerr(+a*)
 //   T4  Null-geodesic Hamiltonian constraint |K|/(E^2 (r^2+a^2)) stays
 //       small along Kerr/KN rays (max + median monitored).
 //   T5  Convergence: halving the step-quality (and doubling the step
@@ -129,11 +130,12 @@ static void setCamera(RenderParams& P, float az, float el, float dist)
 }
 
 static RenderParams makeParams(int model, float aStar, float q,
-                               float dPhi = 0.012f, int maxSteps = 4000)
+                               float dPhi = 0.012f, int maxSteps = 4000,
+                               bool allowNaked = false)
 {
     RenderParams P;
     float M = 0.5f;
-    BHDerived d = bhValidateAndDerive(model, M, aStar, q);
+    BHDerived d = bhValidateAndDerive(model, M, aStar, q, allowNaked);
     P.model   = model;
     P.M       = M;
     P.aSpin   = d.a;
@@ -141,8 +143,9 @@ static RenderParams makeParams(int model, float aStar, float q,
     P.rPlus   = d.rPlus;
     P.rPhoton = d.rPhoton;
     P.rErgo   = d.rErgo;
+    P.allowNaked = allowNaked ? 1 : 0;
     P.diskInner = d.rIsco;
-    P.diskOuter = 12.f;
+    P.diskOuter = 8.f;
     P.diskEnabled = 0;      // pure geometry for the comparison tests
     P.dPhi = dPhi;
     P.maxSteps = maxSteps;
@@ -257,6 +260,21 @@ static void testHorizons()
         check(std::fabs(s.rPhoton - 3.f * M) < 1e-4f,
               "Schwarzschild photon sphere = 3M");
     }
+    // Retrograde Kerr: same |a*| => same r+, larger ISCO than prograde
+    {
+        float M = 0.5f, ap = 0.9f, am = -0.9f, q0 = 0.f;
+        float a1 = ap, a2 = am, qq = q0;
+        BHDerived dP = bhValidateAndDerive(BH_KERR, M, a1, qq);
+        qq = 0.f;
+        BHDerived dM = bhValidateAndDerive(BH_KERR, M, a2, qq);
+        check(std::fabs(dP.rPlus - dM.rPlus) < 1e-5f,
+              "Kerr +/-a* share the same r+");
+        check(dM.rIsco > dP.rIsco + 0.1f * M,
+              "Kerr retrograde ISCO outside prograde ISCO");
+        double rp = 0.5 + std::sqrt(0.25 - (0.9 * 0.5) * (0.9 * 0.5));
+        check(std::fabs((double)dM.rPlus - rp) < 2e-6,
+              "Kerr a*=-0.9 r+ matches theory");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,11 +296,23 @@ static void testValidation()
               "a* = 5 rejected/clamped, horizon ordered");
     }
     {
+        float M = 0.5f, a = -5.0f, q = 0.f;  // |a*| > 1, retrograde
+        BHDerived d = bhValidateAndDerive(BH_KERR, M, a, q);
+        check(d.clamped && a >= -0.9951f && d.rPlus > 0.f,
+              "a* = -5 clamped to retrograde extremal bound");
+    }
+    {
         float M = 0.5f, a = 0.9f, q = 0.9f;  // a*^2 + q^2 > 1
         BHDerived d = bhValidateAndDerive(BH_KERR_NEWMAN, M, a, q);
         check(d.clamped && a*a + q*q <= BH_EXTREMAL_LIMIT + 1e-4f
               && std::isfinite(d.rPlus),
               "a*^2 + q^2 > 1 scaled back inside the extremal bound");
+    }
+    {
+        float M = 0.5f, a = 1.2f, q = 0.3f;  // naked allowed
+        BHDerived d = bhValidateAndDerive(BH_KERR, M, a, q, true);
+        check(d.naked && d.rPlus == 0.f && std::isfinite(d.rIsco),
+              "allowNaked: a*=1.2 is a naked singularity with r+=0");
     }
     {
         float M = std::nanf(""), a = std::nanf(""), q = -3.f;
@@ -375,6 +405,41 @@ static void testConsistency()
         "RN(q=.5) shadow smaller than Schwarzschild (%d vs %d captured rays)",
         capRN, capS);
     check(capRN < capS, buf);
+
+    // Retrograde vs prograde: same |a*| must produce different images
+    // (frame-dragging asymmetry flips with spin sign).
+    auto Kp = runGrid(makeParams(BH_KERR,  0.7f, 0.0f), NX, NY);
+    auto Km = runGrid(makeParams(BH_KERR, -0.7f, 0.0f), NX, NY);
+    GridDiff dSpin = compareGrids(Kp, Km);
+    auto leftRightBias = [&](const std::vector<Probe>& v) -> int
+    {
+        int L = 0, R = 0;
+        for (int j = 0; j < NY; ++j)
+            for (int i = 0; i < NX; ++i)
+                if (v[j * NX + i].outcome == 0)
+                    (i < NX / 2 ? L : R)++;
+        return L - R;
+    };
+    int biasP = leftRightBias(Kp);
+    int biasM = leftRightBias(Km);
+    std::snprintf(buf, sizeof(buf),
+        "Kerr a*=+/-0.7 images differ (mismatch %d, bias %+d vs %+d)",
+        dSpin.mismatch, biasP, biasM);
+    check(dSpin.mismatch > 0 || dSpin.medianAngle > 1e-3f, buf);
+    // Prefer a clean left/right bias flip when the camera is off-axis enough.
+    if (biasP != 0 || biasM != 0)
+        check(biasP * biasM <= 0,
+              "Kerr a*=+/-0.7 left-right capture bias flips or zeros");
+
+    // Naked singularity smoke: rays terminate without CUDA errors.
+    {
+        auto naked = runGrid(makeParams(BH_KERR, 1.2f, 0.0f, 0.012f, 4000, true),
+                             48, 27);
+        bool any = !naked.empty();
+        for (const Probe& p : naked)
+            any &= (p.outcome == 0 || p.outcome == 1);
+        check(any, "naked Kerr a*=1.2 grid completes with valid outcomes");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +614,22 @@ static void testStability()
     ok = (launchRenderPipeline(out, acc, bA, bB, P, 0) == cudaSuccess)
        && (cudaDeviceSynchronize() == cudaSuccess);
     check(ok, "invalid sampleIndex/accumMode/bloomStrength sanitized");
+
+    // Hot spots (photon-ring dynamics): fixed diskTime, two frames match.
+    P = makeParams(BH_KERR, 0.9f, 0.f);
+    P.width = W; P.height = H; P.diskEnabled = 1; P.bloomEnabled = 1;
+    P.hotSpotsEnabled = 1; P.hotSpotStrength = 1.f;
+    P.diskTime = 1.25f; P.sampleIndex = 0; P.accumMode = 0;
+    CUDA_CHECK(launchRenderPipeline(out, acc, bA, bB, P, 0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(imgA.data(), out, sizeof(uchar4) * W * H,
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(launchRenderPipeline(out, acc, bA, bB, P, 0));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(imgB.data(), out, sizeof(uchar4) * W * H,
+                          cudaMemcpyDeviceToHost));
+    check(std::memcmp(imgA.data(), imgB.data(), sizeof(uchar4) * W * H) == 0,
+          "hot-spot pipeline deterministic at fixed diskTime");
 
     CUDA_CHECK(cudaFree(out)); CUDA_CHECK(cudaFree(acc));
     CUDA_CHECK(cudaFree(bA));  CUDA_CHECK(cudaFree(bB));
