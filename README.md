@@ -1,5 +1,7 @@
 # Black Hole Renderer — Schwarzschild / Reissner–Nordström / Kerr / Kerr–Newman (CUDA + Vulkan)
 
+![Live renderer UI — Kerr disk with photon ring, Doppler-beamed accretion, and procedural starfield](interface.png)
+
 A real-time, physically-motivated renderer of **four black hole families**
 for **Windows x64**, switchable live:
 
