@@ -61,8 +61,9 @@ struct RenderParams
     float    diskTime    = 0.f;   // animation time (seconds, pausable)
 
     // Phenomenological RT scales (emission / absorption along the disk).
-    // Intensity uses I_obs ∝ g^3 I_emit (monochromatic convention).
-    float    diskEmisScale = 4.5f;   // multiplies blackbody * dens * ds * g^3
+    // Intensity uses band-integrated I_obs ∝ g^4 I_emit; the Novikov–Thorne
+    // flux weight is normalized to 1 at its peak (see BH_NT_PEAK_INV).
+    float    diskEmisScale = 1.5f;   // multiplies blackbody * dens * ds * g^4
     float    diskAbsScale  = 2.2f;   // optical-depth scale (keeps shadow crisp)
 
     // Orbiting hot spots near the ISCO (EHT-style flares). Lensed into the

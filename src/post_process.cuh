@@ -76,9 +76,10 @@ __device__ inline float3 accumBlend(float3 prev, float3 cur,
 __device__ inline float3 bloomBrightPass(float3 c)
 {
     float l = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-    // Higher threshold: bloom only the photon-ring / beamed inner disk,
-    // not the whole outer annulus (avoids a soft yellow pancake glow).
-    float w = smoothstepf(1.15f, 2.4f, l);
+    // Threshold just under the tone-map shoulder: the photon ring, beamed
+    // inner disk and the brightest stars bloom; the outer annulus and the
+    // general starfield do not (avoids a soft yellow pancake glow).
+    float w = smoothstepf(0.95f, 2.2f, l);
     return c * w;
 }
 
@@ -125,6 +126,11 @@ __device__ inline uchar4 finalizePixel(float3 hdr, float3 bloom,
     if (P.bloomEnabled) c += bloom * P.bloomStrength;
 
     c = acesToneMap(c);
+    // Mild vibrance: ACES pulls saturated oranges toward gray; restore some
+    // chroma so the disk keeps its EHT palette (applied pre-gamma).
+    float lum = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    float3 lv = make_float3(lum, lum, lum);
+    c = clamp3(lv + (c - lv) * 1.12f, 0.f, 1.f);
     c = pow3(c, 1.0f / 2.2f);
 
     // Triangular-pdf spatial dither (+-1 LSB) decorrelates quantization

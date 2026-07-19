@@ -44,7 +44,8 @@
 //   g = 1 / [ u^t (E - Omega Lz) ]
 // of a circular equatorial Keplerian emitter (Schwarzschild / RN with a=0,
 // Kerr / KN with spin). Photon (E, Lz) come from a static-observer tetrad
-// at the camera. Intensity uses I_nu ∝ g^3 with T_obs = g T_emit.
+// at the camera. Intensity uses band-integrated I_obs ∝ g^4 with
+// T_obs = g T_emit.
 //
 // Slow light: coordinate flight time is accumulated along the backward ray
 // so turbulent advection uses t_emit = diskTime - t_flight (emission earlier
@@ -58,11 +59,15 @@
 #include "vec_math.cuh"
 #include <cuda_runtime.h>
 
-// Disk temperature scale [K-ish] for blackbodyRGB — tuned for orange/red
-// EHT–Gargantua palette after g-factor shift (avoid green midtones).
-constexpr float BH_T_INNER  = 11500.f;
-constexpr float BH_T_CORONA = 16000.f;
+// Disk temperature scale [K]: rest-frame T_eff at the Novikov–Thorne flux
+// peak. Chosen so the Doppler-beamed inner rim tone-maps to white-hot and
+// the outer disk falls through yellow-orange into deep red (EHT/Gargantua
+// palette after the g-factor shift).
+constexpr float BH_T_INNER  = 13500.f;
 constexpr float BH_PI       = 3.14159265358979f;
+// 1 / peak value of bhThinDiskFluxWeight (peak sits near r ≈ 1.25 r_in).
+// Normalizes the flux profile to [0,1] so BH_T_INNER is actually reached.
+constexpr float BH_NT_PEAK_INV = 1.f / 0.075f;
 
 // Capture surface radius: event horizon when present, else singularity cut.
 __device__ inline float bhCaptureRadius(const RenderParams& P)
@@ -115,56 +120,78 @@ __device__ inline float3 blackbodyRGB(float kelvin)
 }
 
 // ---------------------------------------------------------------------------
-// Procedural starfield + faint nebula, evaluated on the *deflected* escape
+// Procedural starfield + Milky-Way band, evaluated on the *deflected* escape
 // direction => the background exhibits the gravitational lensing field.
+//
+// One star population per cubic cell lattice. Magnitudes follow a steep
+// power law (many faint stars, exponentially fewer bright ones) and colours
+// are per-star blackbody, skewed towards cool orange stars with a few hot
+// blue-white ones — no uniform tint wash.
 // ---------------------------------------------------------------------------
-__device__ inline float3 starLayer(float3 d, float cellScale, float intensity)
+__device__ inline float3 starLayer(float3 d, float cellScale, float intensity,
+                                   float coreSharp)
 {
     float3 p  = d * cellScale;
     float3 id = make_float3(floorf(p.x), floorf(p.y), floorf(p.z));
     float3 f  = make_float3(p.x - id.x, p.y - id.y, p.z - id.z);
 
     float3 h  = hash33(id);
-    float3 sp = make_float3(0.15f + 0.7f * h.x, 0.15f + 0.7f * h.y, 0.15f + 0.7f * h.z);
+    float3 sp = make_float3(0.10f + 0.80f * h.x, 0.10f + 0.80f * h.y,
+                            0.10f + 0.80f * h.z);
     float3 dv = f - sp;
     float  d2 = dot(dv, dv);
 
-    float mag    = hash12(make_float2(id.x + 91.7f * id.z, id.y - 33.1f * id.x));
-    float bright = 0.02f + 8.0f * powf(mag, 24.f);
-    float core   = expf(-d2 * 260.f);
+    float mag = hash12(make_float2(id.x + 91.7f * id.z, id.y - 33.1f * id.x));
+    // Cheap reject: only the brightest stars keep a wide halo footprint.
+    float cut = (mag > 0.9f) ? 60.f : 14.f;
+    if (d2 * coreSharp > cut) return make_float3(0.f, 0.f, 0.f);
 
-    float  tint = hash12(make_float2(id.y + 7.3f, id.z - 3.1f));
-    float3 col  = lerp3(make_float3(0.72f, 0.82f, 1.0f),
-                        make_float3(1.0f, 0.82f, 0.62f), tint);
+    float bright = 0.05f * powf(mag, 9.f) + 9.0f * powf(mag, 50.f);
+    float core   = expf(-d2 * coreSharp);
+    float glow   = expf(-d2 * coreSharp * 0.10f);  // soft halo, visible only
+                                                   // around the brightest stars
+    float tsel   = hash12(make_float2(id.y + 7.3f, id.z - 3.1f));
+    float kelvin = 2600.f + 12000.f * tsel * tsel;   // median ~5600 K: warm
+                                                     // whites with orange and
+                                                     // blue-white outliers
+    float3 col   = blackbodyRGB(kelvin);
+    float  lum   = 0.2126f * col.x + 0.7152f * col.y + 0.0722f * col.z;
+    col = col * (1.f / fmaxf(lum, 1e-4f));
 
-    return col * (bright * core * intensity);
+    return col * ((core + 0.08f * glow) * bright * intensity);
 }
 
-// gCam = E_cam / E_infty (static-observer blueshift of the sky).
+// gCam = E_cam / E_infty (static-observer blueshift of the sky); the sky is
+// scaled bolometrically by g^4.
 __device__ inline float3 backgroundColor(float3 dir, float gCam = 1.f)
 {
     float3 d = normalize(dir);
-    float3 c = make_float3(0.f, 0.f, 0.f);
 
     float Tscale = clampf(gCam, 0.5f, 3.f);
     float Iscale = Tscale * Tscale * Tscale * Tscale;
 
-    c += starLayer(d, 90.f,  1.0f);
-    c += starLayer(d, 210.f, 0.45f);
-    c += starLayer(d, 460.f, 0.18f);
+    float3 c = make_float3(0.f, 0.f, 0.f);
+    c += starLayer(d,  80.f, 1.00f, 320.f);   // sparse bright stars
+    c += starLayer(d, 190.f, 0.55f, 520.f);
+    c += starLayer(d, 420.f, 0.30f, 820.f);
+    c += starLayer(d, 900.f, 0.14f, 1500.f);  // dense faint background dust
 
-    float3 hot  = blackbodyRGB(6500.f * Tscale);
-    float3 tint = hot / fmaxf((hot.x + hot.y + hot.z) / 3.f, 1e-4f);
-    // Component-wise mix: 0.55 * white + 0.45 * tint (no float+float3 op).
-    c = c * (make_float3(0.55f, 0.55f, 0.55f) + tint * 0.45f) * Iscale;
+    // Milky-Way band: warm structured glow broken by dark dust lanes.
+    // Noise runs in a seam-free plane projection of the direction (no
+    // atan2 wrap line in the sky).
+    float2 q    = make_float2(d.x, d.z) * (3.0f / (1.35f + fabsf(d.y)));
+    float  neb  = fbm(q);
+    float  dust = fbm(make_float2(q.x * 2.6f + 31.4f, q.y * 2.6f - 17.2f));
+    float  band = expf(-d.y * d.y * 16.f);
+    float  lanes = clampf(1.25f - 1.35f * dust, 0.f, 1.f);
+    c += (make_float3(0.020f, 0.024f, 0.038f)
+        + make_float3(0.030f, 0.022f, 0.014f) * neb) * (neb * band * lanes);
 
-    float az   = atan2f(d.z, d.x);
-    float neb  = fbm(make_float2(az * 2.2f, d.y * 5.0f));
-    float band = expf(-d.y * d.y * 14.f);
-    c += make_float3(0.020f, 0.024f, 0.045f) * (neb * band) * Iscale;
-    c += make_float3(0.004f, 0.005f, 0.009f) * Iscale;
+    // Faint airglow floor keeps the deep sky just off pure black (the
+    // dither decorrelates the 8-bit quantization there).
+    c += make_float3(0.0012f, 0.0015f, 0.0026f);
 
-    return c;
+    return c * Iscale;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +262,8 @@ __device__ inline float wrapDeltaPhi(float d)
 // Thin-disk radiative model (Gargantua / EHT–inspired, real-time GR):
 //   • Keplerian orbital velocity field Ω(r) from the metric
 //   • Exact g = 1/[u^t (E − Ω Lz)]  (grav. redshift + Doppler beaming)
-//   • Novikov–Thorne flux → T(r) ∝ F^{1/4}, blackbody colour
-//   • I_obs ∝ g^3 B_ν(T_obs) with T_obs = g T_emit  (I_ν invariant)
+//   • Novikov–Thorne flux (peak-normalized) → T(r) ∝ F^{1/4}, blackbody colour
+//   • Band-integrated I_obs ∝ g^4 B(T_obs) with T_obs = g T_emit
 //   • Volumetric GR path integral along null geodesics (caller)
 // ---------------------------------------------------------------------------
 __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& ctx,
@@ -248,8 +275,8 @@ __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& c
     float  segLen = length(seg);
     if (segLen < 1e-7f) return;
 
-    // Thin disk: tight vertical cull (H/R ~ few percent)
-    float maxH = 0.10f * sqrtf(P.diskOuter) * 3.0f;
+    // Thin disk: tight vertical slab cull (H/R ~ 5%, 2.6-sigma tail)
+    float maxH = 0.16f * P.diskOuter;
     if (a.y > maxH && b.y > maxH) return;
     if (a.y < -maxH && b.y < -maxH) return;
 
@@ -259,13 +286,14 @@ __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& c
     if (rcMin - segLen > P.diskOuter) return;
     if (rcMax + segLen < P.diskInner) return;
 
-    int nSub = 1 + (int)(segLen / 0.12f);
-    if (nSub > 14) nSub = 14;
+    int nSub = 1 + (int)(segLen * 6.5f);
+    if (nSub > 12) nSub = 12;
     float ds = segLen / (float)nSub;
 
-    const float emisK = P.diskEmisScale;
-    const float absK  = P.diskAbsScale;
-    const float rin   = fmaxf(P.diskInner, 1e-4f);
+    const float emisK  = P.diskEmisScale;
+    const float absK   = P.diskAbsScale;
+    const float rin    = fmaxf(P.diskInner, 1e-4f);
+    const float invOut = 1.f / fmaxf(P.diskOuter, rin);
     const float M = P.M, aSpin = ctx.a, Qc = ctx.Q;
 
     for (int j = 0; j < nSub; ++j)
@@ -275,18 +303,22 @@ __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& c
         float  rc = sqrtf(p.x * p.x + p.z * p.z);
         if (rc < rin || rc > P.diskOuter) continue;
 
-        // Thin Gaussian vertical structure, H/R ≈ 0.05–0.08
-        float HR = 0.055f + 0.02f * (rc / fmaxf(P.diskOuter, rin));
+        // Thin Gaussian vertical structure, H/R ≈ 0.04–0.055
+        float HR = 0.040f + 0.015f * (rc * invOut);
         float H  = HR * rc;
         float dz = p.y / fmaxf(H, 1e-4f);
-        if (fabsf(dz) > 3.0f) continue;
-        float dens = expf(-dz * dz);
+        if (fabsf(dz) > 2.6f) continue;
 
-        // Soft ISCO wall; hard outer die-off
-        dens *= smoothstepf(rin, rin * 1.12f, rc);
-        dens *= 1.0f - smoothstepf(P.diskOuter * 0.55f, P.diskOuter, rc);
-        dens *= 1.f - 0.65f * smoothstepf(0.25f, 0.85f,
-                         fabsf(p.y) / fmaxf(rc, 0.15f));
+        // Novikov–Thorne flux first: cheap gate before any noise work.
+        // Normalized to peak 1 so BH_T_INNER is reached at the emission peak.
+        float Fr = bhThinDiskFluxWeight(rc, rin) * BH_NT_PEAK_INV;
+        bool wantSpots = P.hotSpotsEnabled && P.hotSpotStrength > 1e-4f
+                       && rc < rin * 1.60f;   // ~3 sigma of the outer spot
+        if (Fr < 1e-6f && !wantSpots) continue;
+
+        float dens = expf(-dz * dz);
+        dens *= smoothstepf(rin, rin * 1.10f, rc);           // soft ISCO wall
+        dens *= 1.0f - smoothstepf(P.diskOuter * 0.60f, P.diskOuter, rc);
 
         // --- Orbital velocity + full GR g-factor (all models) -----------
         float omega = bhOmegaCircular(rc, M, aSpin, Qc);
@@ -294,24 +326,24 @@ __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& c
         float g = bhEmitterGFactor(rc, M, aSpin, Qc, ctx.E, ctx.Lz);
         if (g <= 0.f) continue;
 
-        // --- Turbulence + spiral arms (filamentary plasma) -------------
+        // --- Filamentary plasma: large-scale turbulent patches + fine
+        //     concentric striations sheared by the differential rotation.
         // Azimuth matches kerrToCart (spin +Y): φ = atan2(-z, x)
         float azim = atan2f(-p.z, p.x);
         float azr  = azim - omega * tEmit;
-        float n0   = fbm(make_float2(rc * 4.2f, azr * 2.1f + rc * 0.9f));
-        float n1   = fbm(make_float2(rc * 9.5f, azr * 4.0f - rc * 1.4f + 19.f));
-        float n2   = fbm(make_float2(rc * 18.f, azr * 7.5f + 5.3f));
-        dens *= (0.18f + 1.15f * n0 + 0.55f * n1 + 0.28f * n2);
+        float n0 = fbm(make_float2(rc * 3.6f, azr * 2.3f + rc * 0.8f));
+        float st = vnoise(make_float2(rc * 21.f - azr * 1.7f,
+                                      azr * 3.5f + rc * 2.2f));
+        dens *= (0.20f + 1.30f * n0) * (0.40f + 1.00f * st);
         dens *= dens;
 
         float psi1 = azim - 0.55f * omega * tEmit - 1.6f * logf(fmaxf(rc, 0.2f));
-        float psi2 = 2.f * azim - 0.38f * omega * tEmit - 1.0f * logf(fmaxf(rc, 0.2f));
-        dens *= (1.f + 0.42f * cosf(psi1) + 0.22f * cosf(psi2));
+        dens *= (1.f + 0.38f * cosf(psi1));
 
         // --- ISCO hot spots (photon-ring dynamics) ---------------------
         float spotBoost = 0.f;
         float spotHeat  = 0.f;
-        if (P.hotSpotsEnabled && P.hotSpotStrength > 1e-4f)
+        if (wantSpots)
         {
             const float rHs0 = rin * 1.06f;
             const float rHs1 = rin * 1.18f;
@@ -341,43 +373,32 @@ __device__ inline void sampleDiskSegment(const RenderParams& P, const DiskCtx& c
         }
         if (dens < 1e-5f && spotBoost < 1e-4f) continue;
 
-        float coronaW = expf(-(fabsf(dz) - 1.6f) * (fabsf(dz) - 1.6f) * 3.0f);
-        float corona  = 0.08f * coronaW;
-
-        // --- NT flux → temperature → blackbody with g^3 ---------------
-        float Fr = bhThinDiskFluxWeight(rc, rin);
-        if (Fr < 1e-8f && spotBoost < 1e-4f) continue;
-
+        // --- Flux → temperature → blackbody with relativistic beaming ---
         // Rest-frame effective temperature T_eff ∝ F^{1/4}
-        float Temit = BH_T_INNER * powf(fmaxf(Fr, 1e-6f), 0.25f);
-        Temit = clampf(Temit, 1800.f, 22000.f);
-        Temit *= (1.f + 1.6f * spotHeat);
+        float Temit = BH_T_INNER * powf(clampf(Fr, 1e-6f, 1.f), 0.25f);
+        Temit = clampf(Temit * (1.f + 1.6f * spotHeat), 2000.f, 26000.f);
 
         // Frequency shift: ν_obs = g ν_emit ⇒ T_obs = g T_emit for Planckian
         float Tobs = clampf(Temit * g, 1200.f, 40000.f);
         float3 col = blackbodyRGB(Tobs);
-        // Specific intensity: I_ν / ν^3 invariant ⇒ I_obs ∝ g^3 I_emit
+        // Band-integrated intensity: I_obs ∝ g^4 I_emit (bolometric),
+        // which carries the full Doppler-beaming asymmetry of the disk.
         float g3   = g * g * g;
-        float emis = Fr * g3 * (1.f + spotBoost);
-
-        float3 colC  = blackbodyRGB(clampf(BH_T_CORONA * g * (1.f + 0.4f * spotHeat),
-                                           1200.f, 40000.f));
-        float  emisC = 0.22f * emis * g;
+        float emis = Fr * g3 * g * (1.f + spotBoost);
 
         float w  = dens * ds;
-        float wC = corona * dens * ds;
-        float3 add = col * (emis * emisK * w) + colC * (emisC * emisK * wC);
+        float3 add = col * (emis * emisK * w);
         if (spotBoost > 1e-4f)
         {
             float wS = (0.12f + dens) * ds;
-            add += col * (spotBoost * g3 * emisK * 0.45f * wS);
+            add += col * (spotBoost * g3 * emisK * 0.55f * wS);
         }
         accum += add * trans;
 
         // Transfer: dI = j ds − α I ds  (emission + absorption along ray)
-        float tau = absK * (w + 0.45f * wC) * (1.f + 0.35f * dens) * 1.05f;
+        float tau = absK * w * (1.f + 0.35f * dens);
         trans *= expf(-tau);
-        if (trans < 0.01f) return;
+        if (trans < 0.012f) return;
     }
 }
 
@@ -503,14 +524,17 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
 
     float3 prevPos = c;
     float3 dir3    = dir;
-    // Adaptive angular step: near-radial rays need smaller dφ so RK4 stays
-    // stable without clamping u' (which would corrupt capture vs escape).
+    // Adaptive angular step, recomputed every iteration:
+    //   * weak field (r >> r_photon): the Binet ODE is nearly linear
+    //     (u'' ≈ -u), so RK4 stays accurate with steps up to 6x dPhi,
+    //     growing linearly with r — far-field flight costs few steps;
+    //   * strong field (r <~ 9M): full dPhi resolution, unchanged from the
+    //     fixed-step integrator, so shadow-boundary classification and the
+    //     step-halving convergence order are preserved;
+    //   * near-radial rays (large |u'|): step shrinks so |Δu| per step is
+    //     bounded without clamping u' (which would corrupt capture/escape).
+    const float invNineM = 1.f / (9.f * M);
     float h = P.dPhi;
-    {
-        float hNeed = 0.08f / fmaxf(fabsf(du), 1.f);
-        if (h > hNeed) h = hNeed;
-        if (h < P.dPhi * 0.05f) h = P.dPhi * 0.05f;
-    }
 
     // RHS of the generalized Binet equation
     auto acc = [M, Q2](float uu)
@@ -521,6 +545,10 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
     int step = 0;
     for (; step < P.maxSteps; ++step)
     {
+        float hMax = P.dPhi * clampf(invNineM / u, 1.f, 6.f);  // ∝ r far out
+        h = fminf(hMax, 0.10f / fmaxf(fabsf(du), 1e-6f));
+        if (h < P.dPhi * 0.03f) h = P.dPhi * 0.03f;
+
         float k1u = du;
         float k1v = acc(u);
 
@@ -547,6 +575,8 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
         // hand-drawn radius or a reduced impact-parameter ball.
         if (!isfinite(u) || !isfinite(du)) { R.horizon = true; break; }
         if (u >= uHor)                     { R.horizon = true; break; }
+        // Deep far-field overshoot (near-radial escape): done.
+        if (u < 1e-4f) { R.escaped = true; R.escDir = dir3; break; }
 
         float  r  = 1.0f / u;
         float  cp = cosf(phi), sp = sinf(phi);
@@ -567,18 +597,6 @@ __device__ inline TraceResult traceSpherical(const RenderParams& P,
 
         // Escape: past large radius with outward motion
         if (u < uEscape && du < 0.f) { R.escaped = true; R.escDir = dir3; break; }
-
-        // Keep |Δu| per step bounded by refining h (no artificial capture).
-        float duAbs = fabsf(du);
-        if (duAbs * h > 0.15f)
-        {
-            h = 0.12f / fmaxf(duAbs, 1.f);
-            if (h < P.dPhi * 0.03f) h = P.dPhi * 0.03f;
-        }
-        else if (h < P.dPhi && duAbs * h < 0.02f)
-        {
-            h = fminf(P.dPhi, h * 1.25f);
-        }
     }
     R.steps = step;
 
@@ -781,11 +799,11 @@ __device__ inline TraceResult traceKerr(const RenderParams& P,
         if (trackPos && y.r < P.diskOuter * 1.3f)
         {
             // Fine sampling only where the ray can actually be inside the
-            // disk slab (|y| < ~3H_max); segments approaching from above or
-            // below use a medium cap so the slab entry is still subsampled
-            // finely by sampleDiskSegment.
+            // disk slab (|y| < ~2.6 sigma of H_max); segments approaching
+            // from above or below use a medium cap so the slab entry is
+            // still subsampled finely by sampleDiskSegment.
             float yAbs = y.r * fabsf(cosf(y.th));
-            capLen = (yAbs < 3.5f) ? 1.2f : 2.0f;
+            capLen = (yAbs < 1.8f) ? 1.2f : 2.2f;
         }
         else capLen = fmaxf(1.2f, 0.22f * y.r);
         h = fminf(h, capLen / spd);

@@ -114,11 +114,15 @@ extern "C" cudaError_t launchRenderPipeline(uchar4* out, float4* accum,
     sanitizeRenderParams(P);
 
     const int bw = (P.width + 1) / 2, bh = (P.height + 1) / 2;
+    // Trace kernel is register-heavy: 128-thread blocks give it better
+    // occupancy. The memory-bound post-process kernels keep 256.
+    dim3 blockT(16, 8);
+    dim3 gridT((P.width + 15) / 16, (P.height + 7) / 8);
     dim3 block(16, 16);
     dim3 grid((P.width + 15) / 16, (P.height + 15) / 16);
     dim3 hgrid((bw + 15) / 16, (bh + 15) / 16);
 
-    KLAUNCH(renderAccumKernel, grid, block, stream, accum, P);
+    KLAUNCH(renderAccumKernel, gridT, blockT, stream, accum, P);
     if (P.bloomEnabled)
     {
         KLAUNCH(bloomDownsampleKernel, hgrid, block, stream, accum, bloomA, P, bw, bh);
@@ -151,7 +155,7 @@ extern "C" cudaError_t launchRenderKernel(uchar4* out, const RenderParams& p,
     sanitizeRenderParams(P);
     P.bloomEnabled = 0;
 
-    dim3 block(16, 16);
+    dim3 block(16, 8);
     dim3 grid((P.width + block.x - 1) / block.x,
               (P.height + block.y - 1) / block.y);
     KLAUNCH(renderKernel, grid, block, stream, out, P);

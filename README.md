@@ -156,21 +156,22 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
 - **Finite-thickness accretion disk** (inner edge = the **numerically
   computed ISCO of the current model** — 6M for Schwarzschild, sweeping in
   toward the horizon with prograde spin — out to **~16M** by default;
-  thin Gaussian vertical profile with H/R ≈ 0.05–0.08) sampled volumetrically
+  thin Gaussian vertical profile with H/R ≈ 0.04–0.055) sampled volumetrically
   along the geodesic with sub-stepping and self-absorption (transmittance),
   so the disk correctly appears in front of, behind (lensed over/under), and
   inside the photon ring.
 - **Novikov–Thorne thin-disk flux** F(r) ∝ r⁻³ (1 − √(r_in/r)) with an
-  inner peak just outside the ISCO; rest-frame T_eff ∝ F^{1/4} mapped through
-  a black-body colour fit → hot orange inner edge, deep red outer filaments
-  (EHT / Gargantua palette).
+  inner peak just outside the ISCO, normalized to 1 at its peak; rest-frame
+  T_eff ∝ F^{1/4} mapped through a black-body colour fit → white-hot inner
+  rim, yellow-orange midtones, deep red outer filaments (EHT / Gargantua
+  palette).
 - **Unified GR emitter model (all four metrics):** photon conserved (E, L_z)
   from a static-observer tetrad at the camera; circular Keplerian Ω(r) from
   the metric; redshift factor
   **g = 1 / [uᵗ (E − Ω L_z)]** (gravitational redshift + Doppler beaming +
-  frame dragging when a ≠ 0). Observed specific intensity uses
-  **I_ν,obs ∝ g³ I_ν,emit** with T_obs = g T_emit for the Planck spectrum —
-  approaching side brighter/hotter, receding side dimmer/redder.
+  frame dragging when a ≠ 0). Observed band-integrated intensity uses
+  **I_obs ∝ g⁴ I_emit** with T_obs = g T_emit for the Planck spectrum —
+  approaching side markedly brighter/hotter, receding side dimmer/redder.
 - **HDR display pipeline with progressive anti-aliasing:** every frame
   traces one jittered sub-pixel sample (R2 low-discrepancy sequence) into a
   linear-HDR float4 accumulation buffer. While the camera and model are
@@ -189,12 +190,17 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
   triangular-pdf spatial dither → 8-bit (R/B swap for BGRA swapchains). The
   dither removes 8-bit banding in the dark background and is static per
   pixel, so a converged image is perfectly still.
-- Turbulent disk detail via high-contrast multi-scale differentially-rotating
-  fBm filaments, m=1/m=2 spiral arms, a soft corona layer, and **slow-light**
-  advection (emission time = observation time − geodesic flight time),
-  animated in real time (SPACE to pause).
+- Turbulent disk detail via differentially-rotating fBm patches sheared into
+  fine concentric striations, an m=1 spiral arm, and **slow-light** advection
+  (emission time = observation time − geodesic flight time), animated in
+  real time (SPACE to pause).
+- **Procedural starfield** with a steep power-law magnitude distribution
+  (many faint stars, exponentially fewer bright ones with soft halos),
+  per-star black-body colours skewed toward cool orange with occasional hot
+  blue-white stars, and a structured Milky-Way band with dark dust lanes
+  (seam-free direction-space noise).
 - **Starfield energy shift:** escaped rays sample the sky with the static
-  observer's camera g-factor (temperature and bolometric intensity), so the
+  observer's camera g-factor (bolometric g⁴ intensity scaling), so the
   background is no longer energy-blind.
 - **Orbiting hot spots** (`H`, on by default with the disk): one–two compact
   flares just outside the ISCO co-rotate at Ω(r) with mild flicker. The same
@@ -284,6 +290,15 @@ validation battery:
   skips per-step Cartesian conversion entirely.
 - Trigonometry uses the fused `__sincosf` device intrinsic.
 
+The spherical (Schwarzschild / Reissner–Nordström) integrator uses the same
+idea: the angular RK4 step grows linearly with r (up to 6× dPhi) in the
+weak field where the Binet equation is nearly linear, keeps full dPhi
+resolution below r ≈ 9M, and shrinks for near-radial rays so |Δu| per step
+stays bounded — shadow-boundary classification and the step-halving
+convergence order are unchanged. Disk sampling additionally gates all noise
+evaluation behind the (cheap) Novikov–Thorne flux test, and the geodesic
+trace kernel launches as 128-thread blocks for better occupancy.
+
 Measured on the shared integrator code (140×140 rays, default camera,
 balanced preset): Kerr a\*=0.9 with disk **4.5× faster** than the initial
 implementation (Kerr–Newman 3.5×; disk-off Kerr 5.2×), bringing the
@@ -300,17 +315,18 @@ step-halving convergence) passes unchanged on the optimized code.
 
 ## 7. Known limitations
 
-- **Radiative transfer is still approximate:** emission/absorption with
-  parameterized scales, a soft corona layer, mild RGB opacity split, and
-  camera g-factor blueshift of the starfield. No full frequency-dependent
-  transfer equation and no polarization (ipole-class RT remains out of scope).
+- **Radiative transfer is still approximate:** gray emission/absorption with
+  parameterized scales and camera g-factor blueshift of the starfield. No
+  full frequency-dependent transfer equation and no polarization
+  (ipole-class RT remains out of scope).
 - **Naked singularities** are opt-in (`N`): by default parameters stay inside
   a*² + q² ≤ 0.995. In naked mode rays terminate on a small coordinate cut
   (r ≈ 0.05 M) rather than a true curvature singularity treatment.
 - **Spin is signed** (a* ∈ [−0.995, 0.995] by default; co-rotating disk/ISCO).
 - Disk turbulence uses **slow-light** advection (t_emit = t_obs − Δt along the
-  backward geodesic) plus multi-scale fBm and m=1/m=2 spiral arms — still
-  **not a GRMHD simulation** (no live MHD, no precomputed dump loading yet).
+  backward geodesic) plus sheared fBm/striation noise and an m=1 spiral arm —
+  still **not a GRMHD simulation** (no live MHD, no precomputed dump loading
+  yet).
 - Camera placement uses r = |x| spherical mapping rather than the oblate
   Boyer–Lindquist embedding (negligible at camera distances ≥ 2.2 units).
 - Windowed mode is fixed at 1280×720; `F11` switches to native fullscreen

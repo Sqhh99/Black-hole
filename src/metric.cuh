@@ -410,7 +410,7 @@ inline bool sanitizeRenderParams(RenderParams& P)
     if (P.sampleIndex > 65536)  { P.sampleIndex = 65536; fixed = true; }
     if (P.accumMode < 0 || P.accumMode > 2) { P.accumMode = 0; fixed = true; }
     fixf(P.bloomStrength, 0.f, 4.f, 0.35f);
-    fixf(P.diskEmisScale, 0.f, 50.f, 4.5f);
+    fixf(P.diskEmisScale, 0.f, 50.f, 1.5f);
     fixf(P.diskAbsScale,  0.f, 20.f, 2.2f);
     fixf(P.hotSpotStrength, 0.f, 8.f, 0.65f);
     if (P.hotSpotsEnabled != 0 && P.hotSpotsEnabled != 1)
