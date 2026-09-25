@@ -60,11 +60,18 @@ struct RenderParams
     float    diskOuter   = 8.0f;  // ~16M — mid size (24M too large, 12M a bit tight)
     float    diskTime    = 0.f;   // animation time (seconds, pausable)
 
-    // Phenomenological RT scales (emission / absorption along the disk).
-    // Intensity uses band-integrated I_obs ∝ g^4 I_emit; the Novikov–Thorne
-    // flux weight is normalized to 1 at its peak (see BH_NT_PEAK_INV).
-    float    diskEmisScale = 1.5f;   // multiplies blackbody * dens * ds * g^4
-    float    diskAbsScale  = 2.2f;   // optical-depth scale (keeps shadow crisp)
+    // Radiative transfer scales. The disk is an LTE absorber/emitter whose
+    // source function is the observed Planck radiance B(g T) (CIE 1931 ->
+    // linear sRGB, luminance 1 at 6500 K); see sampleDiskSegment.
+    // diskTemp: a cool (low-Eddington, supermassive) disk. After the
+    // g-factor shift the beamed side reads white-hot, the receding side and
+    // the outer annulus fall through gold into orange -- the colour of a
+    // real Planck emitter photographed with a daylight-balanced camera.
+    float    diskTemp      = 5200.f; // rest-frame T_eff [K] at the flux peak
+    float    diskEmisScale = 5.0f;   // source-function (brightness) scale
+    float    diskAbsScale  = 120.f;  // opacity per unit density and length:
+                                     // inner disk tau ~ 20 (solid photosphere),
+                                     // outer taper optically thin (wispy)
 
     // Orbiting hot spots near the ISCO (EHT-style flares). Lensed into the
     // photon ring by the geodesic integrator — not a screen-space overlay.
@@ -81,7 +88,8 @@ struct RenderParams
     int      sampleIndex = 0;    // samples already accumulated
     int      accumMode   = 0;
 
-    // HDR bloom (applied after accumulation, before tone mapping)
+    // Lens glare / bloom (applied after accumulation, before tone mapping):
+    // fraction of bright-source energy spread into the two-scale PSF wing.
     int      bloomEnabled  = 1;
-    float    bloomStrength = 0.35f;
+    float    bloomStrength = 0.14f;
 };

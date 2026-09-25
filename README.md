@@ -62,6 +62,18 @@ cmake --build build --config Release --parallel
 build\Release\blackhole.exe
 ```
 
+**Headless stills** — `blackhole_snapshot.exe` runs the exact interactive
+pipeline (jittered samples → accumulation → glare → tone mapping) without a
+window and writes a PNG, for offline renders and before/after comparisons:
+
+```bat
+build\Release\blackhole_snapshot.exe out.png spp=64
+build\Release\blackhole_snapshot.exe kerr.png model=2 a=0.9 el=0.12 spp=64 w=1920 h=1080
+```
+
+Keys: `model a q az el dist fov spp w h exp bloom disk spots t quality`,
+plus look-dev overrides `temp emis abs glare` (see `tools/snapshot.cu`).
+
 Tip: for a much faster first compile targeting only your GPU, add
 `-DCMAKE_CUDA_ARCHITECTURES=native` to the configure step (default builds
 for SM 61/75/86/89).
@@ -155,25 +167,46 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
 - **Photon ring:** rays passing near the r = 1.5 rs photon sphere wind around
   the hole multiple times and sample the disk/sky repeatedly, so the bright
   thin ring at the shadow edge **emerges from the integration itself**.
-- **Finite-thickness accretion disk** (inner edge = the **numerically
-  computed ISCO of the current model** — 6M for Schwarzschild, sweeping in
-  toward the horizon with prograde spin — out to **~16M** by default;
-  thin Gaussian vertical profile with H/R ≈ 0.04–0.055) sampled volumetrically
-  along the geodesic with sub-stepping and self-absorption (transmittance),
-  so the disk correctly appears in front of, behind (lensed over/under), and
-  inside the photon ring.
+- **Optically thick, geometrically thin accretion disk** (inner edge = the
+  **numerically computed ISCO of the current model** — 6M for
+  Schwarzschild, sweeping in toward the horizon with prograde spin — out to
+  **~16M** by default; Gaussian vertical profile with H/R ≈ 0.012–0.022,
+  mildly flared). It is integrated along the geodesic as an **LTE
+  absorber/emitter**: per sub-step I += T·S·(1 − e^{−α ds}), T *= e^{−α ds},
+  with source function S = Planck radiance. The inner disk has τ ≈ 20
+  (a solid photosphere, independent of path length) and thins out in the
+  outer taper, where clumpy opacity makes it wispy. The disk correctly
+  appears in front of, behind (lensed over/under), and inside the photon
+  ring, and occludes the stars behind it.
+- **Alias-free disk sampling:** segments are clipped to the disk slab and
+  sub-stepped at ≤ 0.4 H vertically and ≤ 0.1 units along the ray, with a
+  per-pixel, per-sample golden-ratio offset. Progressive accumulation
+  therefore converges instead of freezing the sampling pattern into
+  moiré / wood-grain bands.
 - **Novikov–Thorne thin-disk flux** F(r) ∝ r⁻³ (1 − √(r_in/r)) with an
-  inner peak just outside the ISCO, normalized to 1 at its peak; rest-frame
-  T_eff ∝ F^{1/4} mapped through a black-body colour fit → white-hot inner
-  rim, yellow-orange midtones, deep red outer filaments (EHT / Gargantua
-  palette).
+  inner peak just outside the ISCO → T_eff ∝ F^{1/4}. `diskTemp` (default
+  5200 K, a cool low-Eddington supermassive disk) is the Schwarzschild peak.
+  At a fixed accretion rate T_peak ∝ r_in^{−3/4}, so prograde spin and charge
+  (smaller ISCO, higher efficiency) run hotter and retrograde spin runs
+  cooler.
 - **Unified GR emitter model (all four metrics):** photon conserved (E, L_z)
   from a static-observer tetrad at the camera; circular Keplerian Ω(r) from
   the metric; redshift factor
   **g = 1 / [uᵗ (E − Ω L_z)]** (gravitational redshift + Doppler beaming +
-  frame dragging when a ≠ 0). Observed band-integrated intensity uses
-  **I_obs ∝ g⁴ I_emit** with T_obs = g T_emit for the Planck spectrum —
-  approaching side markedly brighter/hotter, receding side dimmer/redder.
+  frame dragging when a ≠ 0). Since I_ν/ν³ is invariant, a Planck emitter
+  at T seen with factor g is **exactly a Planck spectrum at gT**. The
+  renderer looks up **B(gT) integrated against the CIE 1931 colour-matching
+  functions** (generated table `src/blackbody_lut.h`, linear sRGB / D65,
+  absolute photometric scale), so colour shift *and* visible-band beaming
+  both come out of the spectrum; there's no ad-hoc g³/g⁴ factor. The
+  approaching side is white-hot (a blue tinge on the beamed photon ring
+  of Kerr), and the receding side and outer annulus fall through gold into
+  orange.
+- **Camera metering:** a hotter disk is far brighter in the visible band,
+  so exposure adapts, like any camera or eye. It compensates 60% (in log)
+  of the model's peak-luminance change relative to Schwarzschild. Switching
+  to a rapidly spinning Kerr hole therefore doesn't blow out, and a
+  retrograde disk isn't murky. The `-`/`=` keys still apply on top.
 - **HDR display pipeline with progressive anti-aliasing:** every frame
   traces one jittered sub-pixel sample (R2 low-discrepancy sequence) into a
   linear-HDR float4 accumulation buffer. While the camera and model are
@@ -184,23 +217,41 @@ window title (updated every 0.5 s) and logged to the console every ~2 s.
   moving average provides temporal anti-aliasing plus a mild, physically
   reasonable motion blur of the orbiting gas. Exposure and bloom apply
   *after* accumulation, so adjusting them never resets convergence.
-- **HDR bloom** (`B` to toggle): smooth bright-pass at half resolution,
-  separable 9-tap Gaussian, bilinear upsample — the photon ring, the beamed
-  side of the disk and the inner edge glow the way hot HDR sources should.
-  Costs a few small kernels per frame, negligible next to the geodesics.
+- **Lens glare** (`B` to toggle): modelled as a low-energy two-scale PSF
+  wing rather than a heavy bloom. A gentle bright-pass at half resolution
+  feeds a separable 9-tap Gaussian (σ ≈ 6 px), then a quarter-resolution
+  level (σ ≈ 13 px). Only ~14% of bright-source energy is spread, so the
+  photon ring, beamed disk and bright stars glow like through real optics
+  without softening the image. Negligible cost next to the geodesics.
 - **Tone mapping & quantization:** exposure → ACES filmic → gamma 2.2 →
   triangular-pdf spatial dither → 8-bit (R/B swap for BGRA swapchains). The
   dither removes 8-bit banding in the dark background and is static per
   pixel, so a converged image is perfectly still.
-- Turbulent disk detail via differentially-rotating fBm patches sheared into
-  fine concentric striations, an m=1 spiral arm, and **slow-light** advection
-  (emission time = observation time − geodesic flight time), animated in
-  real time (SPACE to pause).
-- **Procedural starfield** with a steep power-law magnitude distribution
-  (many faint stars, exponentially fewer bright ones with soft halos),
-  per-star black-body colours skewed toward cool orange with occasional hot
-  blue-white stars, and a structured Milky-Way band with dark dust lanes
-  (seam-free direction-space noise).
+- **Sheared MRI-like turbulence:** seam-free 3D noise on (ln r, cos φ′,
+  sin φ′) in the co-rotating frame, billowy at large scales and ridged
+  (filamentary) at small ones. It modulates temperature (±~10% in T, i.e.
+  ±~40% in visible brightness) and opacity. Each of two layers is born
+  unsheared and winds into **trailing spirals** under the Keplerian Ω(r),
+  as a real eddy does. The layers are crossfaded half a period apart and
+  reset while invisible, so the texture never winds up into aliasing rings
+  however long the app runs. **Slow-light** advection (emission time =
+  observation time − geodesic flight time) is preserved; SPACE pauses.
+- **Procedural starfield of point sources:** each star has a fixed
+  integrated flux (steep power law: many faint, very few bright) and a real
+  blackbody chromaticity, partially desaturated as a sensor records it.
+  Halos are *not* painted into the sky, where lensing would smear them into
+  streaks; glare comes from the screen-space PSF. **Lensed stars stay
+  points:** about the camera–hole axis the lens map is (exactly for
+  Schwarzschild/RN, approximately for Kerr) axisymmetric. Its tangential
+  magnification is μ_t = sin α_image / sin β_source, so each star's sky
+  kernel is shrunk by μ_t along the tangential direction. Stars near the
+  Einstein ring brighten as magnified point sources should, instead of
+  turning into arcs.
+- **Milky Way** tilted ~31° to the disk plane and crossing the default view
+  diagonally: a faint band and bulge of unresolved starlight with dust
+  lanes, plus a denser faint star population toward the galactic plane.
+  The old in-plane band, lensed into a uniform gray fog ring around the
+  hole, is gone.
 - **Starfield energy shift:** escaped rays sample the sky with the static
   observer's camera g-factor (bolometric g⁴ intensity scaling), so the
   background is no longer energy-blind.
@@ -317,16 +368,18 @@ step-halving convergence) passes unchanged on the optimized code.
 
 ## 7. Known limitations
 
-- **Radiative transfer is still approximate:** gray emission/absorption with
-  parameterized scales and camera g-factor blueshift of the starfield. No
-  full frequency-dependent transfer equation and no polarization
-  (ipole-class RT remains out of scope).
+- **Radiative transfer is still approximate:** gray (frequency-independent)
+  opacity with a Planck LTE source function and parameterized density /
+  opacity scales, no limb darkening, no Compton-hardened (colour-corrected)
+  spectrum, no polarization (ipole-class RT remains out of scope). The
+  point-star lens map uses the axisymmetric tangential magnification only
+  (the radial magnification is not applied).
 - **Naked singularities** are opt-in (`N`): by default parameters stay inside
   a*² + q² ≤ 0.995. In naked mode rays terminate on a small coordinate cut
   (r ≈ 0.05 M) rather than a true curvature singularity treatment.
 - **Spin is signed** (a* ∈ [−0.995, 0.995] by default; co-rotating disk/ISCO).
 - Disk turbulence uses **slow-light** advection (t_emit = t_obs − Δt along the
-  backward geodesic) plus sheared fBm/striation noise and an m=1 spiral arm —
+  backward geodesic) plus sheared, crossfaded 3D noise —
   still **not a GRMHD simulation** (no live MHD, no precomputed dump loading
   yet).
 - Camera placement uses r = |x| spherical mapping rather than the oblate
@@ -355,15 +408,20 @@ src/
   trace.cuh                 shared device physics: generalized Binet
                             integrator (Schw/RN), Boyer-Lindquist
                             Hamiltonian integrator (Kerr/KN), tetrad camera
-                            mapping, disk shading with exact g-factor,
-                            starfield, ACES tone mapping
+                            mapping, LTE disk transfer with exact
+                            g-factor, point-source starfield + lens map
   metric.cuh                Kerr-Newman metric math, horizons, photon
                             region, numeric ISCO, validation/clamping,
                             parameter sanitation (host + device)
   render_params.h           POD shared between host and device
   kernel_launch.h           launch wrapper macro
-  vec_math.cuh              device float2/3 math, hashing, fBm noise
+  post_process.cuh          accumulation, two-scale glare, ACES, dither
+  blackbody_lut.h           generated CIE 1931 Planck -> linear sRGB table
+  vec_math.cuh              device float2/3 math, hashing, 2D/3D fBm noise
   logger.h                  timestamped console logging
 tests/
   test_main.cu              GPU verification suite (build.cmd test)
+tools/
+  snapshot.cu               headless PNG renderer (blackhole_snapshot.exe)
+  gen_blackbody_lut.py      regenerates src/blackbody_lut.h
 ```

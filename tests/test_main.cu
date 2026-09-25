@@ -611,9 +611,16 @@ static void testStability()
 
     // Invalid accumulation fields are sanitized.
     P.sampleIndex = -7; P.accumMode = 99; P.bloomStrength = std::nanf("");
+    P.diskTemp = std::nanf(""); P.diskAbsScale = -3.f; P.diskEmisScale = 1e9f;
     ok = (launchRenderPipeline(out, acc, bA, bB, P, 0) == cudaSuccess)
        && (cudaDeviceSynchronize() == cudaSuccess);
-    check(ok, "invalid sampleIndex/accumMode/bloomStrength sanitized");
+    {
+        RenderParams S = P;
+        sanitizeRenderParams(S);
+        ok &= std::isfinite(S.diskTemp) && S.diskTemp >= 1500.f
+           && S.diskAbsScale >= 0.f && S.diskEmisScale <= 50.f;
+    }
+    check(ok, "invalid sampleIndex/accumMode/bloom/disk RT params sanitized");
 
     // Hot spots (photon-ring dynamics): fixed diskTime, two frames match.
     P = makeParams(BH_KERR, 0.9f, 0.f);
