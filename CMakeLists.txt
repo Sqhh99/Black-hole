@@ -89,5 +89,19 @@ target_compile_options(blackhole_tests PRIVATE
 target_link_libraries(blackhole_tests PRIVATE CUDA::cudart)
 set_target_properties(blackhole_tests PROPERTIES CUDA_RUNTIME_LIBRARY Static)
 
+# ---------------------------------------------------------------------------
+# Headless still renderer (same pipeline, writes a PNG; no Vulkan / GLFW).
+# ---------------------------------------------------------------------------
+add_executable(blackhole_snapshot
+    tools/snapshot.cu
+    src/black_hole_kernel.cu
+)
+target_include_directories(blackhole_snapshot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(blackhole_snapshot PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(blackhole_snapshot PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3 --use_fast_math>)
+target_link_libraries(blackhole_snapshot PRIVATE CUDA::cudart)
+set_target_properties(blackhole_snapshot PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+
 message(STATUS "CUDA architectures : ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "Vulkan include     : ${Vulkan_INCLUDE_DIRS}")

@@ -96,3 +96,48 @@ VM_FUNC float fbm(float2 p)
     }
     return v;
 }
+
+// 3D hash -> [0,1) (Hoskins "hash13")
+VM_FUNC float hash13(float3 p)
+{
+    p = make_float3(fract(p.x * 0.1031f), fract(p.y * 0.1031f), fract(p.z * 0.1031f));
+    float d = p.x * (p.z + 31.32f) + p.y * (p.y + 31.32f) + p.z * (p.x + 31.32f);
+    p = make_float3(p.x + d, p.y + d, p.z + d);
+    return fract((p.x + p.y) * p.z);
+}
+
+// 3D value noise. Used wherever a 2D parameterization would have a seam
+// (sky directions, disk azimuth), since it can be sampled on closed curves.
+VM_FUNC float vnoise3(float3 p)
+{
+    float3 i = make_float3(floorf(p.x), floorf(p.y), floorf(p.z));
+    float3 f = p - i;
+    float3 u = make_float3(f.x * f.x * (3.f - 2.f * f.x),
+                           f.y * f.y * (3.f - 2.f * f.y),
+                           f.z * f.z * (3.f - 2.f * f.z));
+    float n000 = hash13(i);
+    float n100 = hash13(i + make_float3(1.f, 0.f, 0.f));
+    float n010 = hash13(i + make_float3(0.f, 1.f, 0.f));
+    float n110 = hash13(i + make_float3(1.f, 1.f, 0.f));
+    float n001 = hash13(i + make_float3(0.f, 0.f, 1.f));
+    float n101 = hash13(i + make_float3(1.f, 0.f, 1.f));
+    float n011 = hash13(i + make_float3(0.f, 1.f, 1.f));
+    float n111 = hash13(i + make_float3(1.f, 1.f, 1.f));
+    float x00 = lerpf(n000, n100, u.x), x10 = lerpf(n010, n110, u.x);
+    float x01 = lerpf(n001, n101, u.x), x11 = lerpf(n011, n111, u.x);
+    return lerpf(lerpf(x00, x10, u.y), lerpf(x01, x11, u.y), u.z);
+}
+
+// Anisotropic 3D fBm: `octaves` octaves, frequency doubling per octave.
+VM_FUNC float fbm3(float3 p, int octaves)
+{
+    float v = 0.f, amp = 0.5f, norm = 0.f;
+    for (int i = 0; i < octaves; ++i)
+    {
+        v    += amp * vnoise3(p);
+        norm += amp;
+        p     = make_float3(p.x * 2.03f + 17.1f, p.y * 2.01f - 7.3f, p.z * 1.99f + 3.9f);
+        amp  *= 0.5f;
+    }
+    return v / norm;
+}

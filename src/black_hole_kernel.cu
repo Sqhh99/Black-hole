@@ -6,8 +6,9 @@
 //                          into the linear-HDR accumulation buffer
 //                          (progressive temporal anti-aliasing)
 //   2. bloomDownsample     half-res bright pass on the exposed color
-//   3. bloomBlurH/V        separable 9-tap Gaussian
-//   4. compositeKernel     exposure + bloom + ACES + gamma + dither -> uchar4
+//   3. bloomBlurH/V        separable 9-tap Gaussian (half res)
+//   4. bloomDown2x + blur  quarter-res level of the glare PSF (wide wing)
+//   5. compositeKernel     exposure + glare + ACES + gamma + dither -> uchar4
 //
 // All physics lives in trace.cuh, all post-processing in post_process.cuh
 // (both shared with the test executable and the CPU verification harness).
@@ -83,9 +84,23 @@ __global__ void bloomBlurVKernel(const float4* src, float4* dst, int bw, int bh)
     dst[y * bw + x] = make_float4(s.x, s.y, s.z, 1.f);
 }
 
+// Plain 2x2 box downsample of a float4 image (glare pyramid level).
+__global__ void bloomDown2xKernel(const float4* src, int sw, int sh,
+                                  float4* dst, int dw, int dh)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    float3 s = fetchHalf(src, 2 * x,     2 * y,     sw, sh)
+             + fetchHalf(src, 2 * x + 1, 2 * y,     sw, sh)
+             + fetchHalf(src, 2 * x,     2 * y + 1, sw, sh)
+             + fetchHalf(src, 2 * x + 1, 2 * y + 1, sw, sh);
+    dst[y * dw + x] = make_float4(s.x * 0.25f, s.y * 0.25f, s.z * 0.25f, 1.f);
+}
+
 __global__ void compositeKernel(uchar4* out, const float4* accum,
-                                const float4* bloomTex,
-                                RenderParams P, int bw, int bh)
+                                const float4* bloomTex, const float4* bloomQ,
+                                RenderParams P, int bw, int bh, int qw, int qh)
 {
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
@@ -96,8 +111,15 @@ __global__ void compositeKernel(uchar4* out, const float4* accum,
 
     float3 bloom = make_float3(0.f, 0.f, 0.f);
     if (P.bloomEnabled)
-        bloom = sampleHalfBilinear(bloomTex, (px + 0.5f) * 0.5f,
-                                             (py + 0.5f) * 0.5f, bw, bh);
+    {
+        float3 bh1 = sampleHalfBilinear(bloomTex, (px + 0.5f) * 0.5f,
+                                                  (py + 0.5f) * 0.5f, bw, bh);
+        float3 bq  = bh1;
+        if (bloomQ)
+            bq = sampleHalfBilinear(bloomQ, (px + 0.5f) * 0.25f,
+                                            (py + 0.5f) * 0.25f, qw, qh);
+        bloom = bh1 * BLOOM_W_HALF + bq * BLOOM_W_QUARTER;
+    }
 
     out[py * P.width + px] = finalizePixel(hdr, bloom, P, px, py);
 }
@@ -112,6 +134,9 @@ extern "C" cudaError_t launchRenderPipeline(uchar4* out, float4* accum,
 {
     RenderParams P = p;
     sanitizeRenderParams(P);
+    // Camera metering: hotter (prograde / charged) disks are exposed down,
+    // cooler (retrograde) ones up. Post-accumulation, so no reset needed.
+    if (P.diskEnabled) P.exposure *= bhDiskMeterFactor(P);
 
     const int bw = (P.width + 1) / 2, bh = (P.height + 1) / 2;
     // Trace kernel is register-heavy: 128-thread blocks give it better
@@ -122,14 +147,30 @@ extern "C" cudaError_t launchRenderPipeline(uchar4* out, float4* accum,
     dim3 grid((P.width + 15) / 16, (P.height + 15) / 16);
     dim3 hgrid((bw + 15) / 16, (bh + 15) / 16);
 
+    // Quarter-resolution glare level lives in the (then free) half-res
+    // scratch buffer bloomB: two qw*qh images, when they fit.
+    const int qw = (bw + 1) / 2, qh = (bh + 1) / 2;
+    const bool quarter = 2 * (size_t)qw * qh <= (size_t)bw * bh;
+    float4* q1 = bloomB;
+    float4* q2 = bloomB + (size_t)qw * qh;
+    dim3 qgrid((qw + 15) / 16, (qh + 15) / 16);
+
     KLAUNCH(renderAccumKernel, gridT, blockT, stream, accum, P);
     if (P.bloomEnabled)
     {
         KLAUNCH(bloomDownsampleKernel, hgrid, block, stream, accum, bloomA, P, bw, bh);
         KLAUNCH(bloomBlurHKernel, hgrid, block, stream, bloomA, bloomB, bw, bh);
         KLAUNCH(bloomBlurVKernel, hgrid, block, stream, bloomB, bloomA, bw, bh);
+        if (quarter)
+        {
+            KLAUNCH(bloomDown2xKernel, qgrid, block, stream, bloomA, bw, bh, q1, qw, qh);
+            KLAUNCH(bloomBlurHKernel, qgrid, block, stream, q1, q2, qw, qh);
+            KLAUNCH(bloomBlurVKernel, qgrid, block, stream, q2, q1, qw, qh);
+        }
     }
-    KLAUNCH(compositeKernel, grid, block, stream, out, accum, bloomA, P, bw, bh);
+    KLAUNCH(compositeKernel, grid, block, stream, out, accum, bloomA,
+            (P.bloomEnabled && quarter) ? (const float4*)q1 : nullptr,
+            P, bw, bh, qw, qh);
     return cudaGetLastError();
 }
 

@@ -17,9 +17,12 @@
 //      Exposure and bloom are applied AFTER accumulation, so adjusting them
 //      does not reset convergence.
 //
-//   2. HDR bloom: bright-pass at half resolution, separable 9-tap Gaussian,
-//      bilinear upsample, additive composite. Negligible cost next to the
-//      geodesic integration.
+//   2. Lens glare ("bloom") modelled as a low-energy two-scale PSF wing:
+//      soft bright-pass at half resolution + separable 9-tap Gaussian
+//      (sigma ~6 px), then a quarter-resolution level of the same blur
+//      (sigma ~13 px). Only a few percent of the energy of bright sources
+//      is spread, so hot regions glow like through real optics without
+//      softening the image. Negligible cost next to the geodesics.
 //
 //   3. Dithered quantization: triangular-pdf spatial dither decorrelates the
 //      8-bit rounding error, removing banding in the dark background.
@@ -70,18 +73,20 @@ __device__ inline float3 accumBlend(float3 prev, float3 cur,
 // ---------------------------------------------------------------------------
 // Bloom
 // ---------------------------------------------------------------------------
-// Bright-pass on the *exposed* color: smooth threshold around the tone-map
-// shoulder so only genuinely hot regions (inner disk, photon ring, beamed
-// side) bloom, not the starfield.
+// Bright-pass on the *exposed* color. Physically a lens PSF has no
+// threshold; the gentle knee only keeps the (irrelevant) glare of the dim
+// sky from costing contrast. Bright stars, the photon ring and the beamed
+// disk contribute; everything else effectively does not.
 __device__ inline float3 bloomBrightPass(float3 c)
 {
     float l = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-    // Threshold just under the tone-map shoulder: the photon ring, beamed
-    // inner disk and the brightest stars bloom; the outer annulus and the
-    // general starfield do not (avoids a soft yellow pancake glow).
-    float w = smoothstepf(0.95f, 2.2f, l);
+    float w = smoothstepf(0.3f, 1.5f, l);
     return c * w;
 }
+
+// Relative weights of the two glare scales (half / quarter resolution).
+constexpr float BLOOM_W_HALF    = 0.55f;
+constexpr float BLOOM_W_QUARTER = 0.45f;
 
 // Normalized 9-tap Gaussian (sigma ~ 3 at half resolution, i.e. an
 // effective ~6-pixel radius at full resolution).
@@ -117,7 +122,7 @@ __device__ inline float3 sampleHalfBilinear(const float4* buf,
 }
 
 // ---------------------------------------------------------------------------
-// Final pixel: exposure -> bloom composite -> ACES -> gamma -> dither -> 8bit
+// Final pixel: exposure -> glare composite -> ACES -> gamma -> dither -> 8bit
 // ---------------------------------------------------------------------------
 __device__ inline uchar4 finalizePixel(float3 hdr, float3 bloom,
                                        const RenderParams& P, int px, int py)
